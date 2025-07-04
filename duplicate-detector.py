@@ -396,7 +396,9 @@ class MetadataExtractor:
                     metadata['camera_model'] = str(tags['Image Model']).strip()
 
         # exifread’s HEIC parser may raise a plain AssertionError – catch it as well
-        except (IOError, OSError, KeyError, AttributeError, AssertionError):
+        except (IOError, OSError, KeyError, AttributeError, AssertionError, exifread.core.heic.BadSize) as e:
+            if isinstance(e, exifread.core.heic.BadSize):
+                print(f"Warning: Corrupted HEIC file detected: {image_path}")
             pass
         
         if not metadata['datetime_original'] or not metadata['camera_make']:
