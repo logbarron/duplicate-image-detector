@@ -35,18 +35,16 @@
             --transition: cubic-bezier(0.4, 0, 0.2, 1);
         }
 
-        @media (prefers-color-scheme: dark) {
-            :root {
-                --surface: #1F2937;
-                --surface-2: #111827;
-                --surface-3: #374151;
-                --text-primary: #F9FAFB;
-                --text-secondary: #D1D5DB;
-                --text-tertiary: #9CA3AF;
-                --border: #374151;
-                --border-light: #4B5563;
-                --primary-light: #1E3A8A;
-            }
+        html.dark {
+            --surface: #1F2937;
+            --surface-2: #111827;
+            --surface-3: #374151;
+            --text-primary: #F9FAFB;
+            --text-secondary: #D1D5DB;
+            --text-tertiary: #9CA3AF;
+            --border: #374151;
+            --border-light: #4B5563;
+            --primary-light: #1E3A8A;
         }
 
         body {
@@ -231,6 +229,49 @@
             justify-content: space-between;
         }
 
+        .theme-toggle-floating {
+            position: fixed;
+            bottom: 20px;
+            left: 20px;
+            width: 40px;
+            height: 40px;
+            border: 1px solid var(--border);
+            border-radius: 50%;
+            background: var(--surface);
+            cursor: pointer;
+            transition: all 0.15s var(--transition);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-secondary);
+            box-shadow: var(--shadow-lg);
+            z-index: 1000;
+        }
+
+        .theme-toggle-floating:hover {
+            background: var(--surface-2);
+            border-color: var(--text-tertiary);
+            color: var(--text-primary);
+            transform: scale(1.05);
+        }
+
+        .sun-icon { 
+            display: block; 
+            width: 16px;
+            height: 16px;
+            color: var(--text-secondary);
+        }
+        
+        .moon-icon { 
+            display: none; 
+            width: 16px;
+            height: 16px;
+            color: var(--text-secondary);
+        }
+
+        html.dark .sun-icon { display: none; }
+        html.dark .moon-icon { display: block; }
+
 
         .confidence-indicator {
             display: flex;
@@ -298,10 +339,8 @@
             z-index: 1;
         }
 
-        @media (prefers-color-scheme: dark) {
-            .image-panel.selected-for-deletion {
-                background: #7F1D1D;
-            }
+        html.dark .image-panel.selected-for-deletion {
+            background: #7F1D1D;
         }
 
         .image-header {
@@ -555,15 +594,14 @@
             display: flex;
         }
 
-        @media (prefers-color-scheme: dark) {
-            .status.success {
-                background: rgba(16, 185, 129, 0.1);
-                border-color: rgba(16, 185, 129, 0.3);
-            }
-            .status.error {
-                background: rgba(239, 68, 68, 0.1);
-                border-color: rgba(239, 68, 68, 0.3);
-            }
+        html.dark .status.success {
+            background: rgba(16, 185, 129, 0.1);
+            border-color: rgba(16, 185, 129, 0.3);
+        }
+        
+        html.dark .status.error {
+            background: rgba(239, 68, 68, 0.1);
+            border-color: rgba(239, 68, 68, 0.3);
         }
 
         /* Grid Layouts for Different Image Counts */
@@ -873,6 +911,31 @@
         {% endif %}
     </div>
 
+    <!-- Floating Dark Mode Toggle -->
+    <button id="darkModeToggle" class="theme-toggle-floating" aria-label="Toggle dark mode">
+        <svg class="sun-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" xmlns="http://www.w3.org/2000/svg">
+            <g clip-path="url(#clip0_2880_7340)">
+                <path d="M8 1.11133V2.00022" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+                <path d="M12.8711 3.12891L12.2427 3.75735" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+                <path d="M14.8889 8H14" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+                <path d="M12.8711 12.8711L12.2427 12.2427" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+                <path d="M8 14.8889V14" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+                <path d="M3.12891 12.8711L3.75735 12.2427" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+                <path d="M1.11133 8H2.00022" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+                <path d="M3.12891 3.12891L3.75735 3.75735" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+                <path d="M8.00043 11.7782C10.0868 11.7782 11.7782 10.0868 11.7782 8.00043C11.7782 5.91402 10.0868 4.22266 8.00043 4.22266C5.91402 4.22266 4.22266 5.91402 4.22266 8.00043C4.22266 10.0868 5.91402 11.7782 8.00043 11.7782Z" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+            </g>
+            <defs>
+                <clipPath id="clip0_2880_7340">
+                    <rect width="16" height="16" fill="white"></rect>
+                </clipPath>
+            </defs>
+        </svg>
+        <svg class="moon-icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"></path>
+        </svg>
+    </button>
+
     <script>
         let selectedForDeletion = new Set();
 
@@ -995,6 +1058,53 @@
             } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedForDeletion.size > 0) {
                 e.preventDefault();
                 confirmDelete();
+            }
+        });
+
+        // Dark mode toggle functionality
+        function updateDarkMode() {
+            const savedMode = localStorage.getItem('darkMode');
+            const systemPrefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+            
+            // If user has manually set a preference, use that
+            // If no preference saved, follow system
+            const shouldBeDark = savedMode === 'dark' || (!savedMode && systemPrefersDark);
+            
+            if (shouldBeDark) {
+                document.documentElement.classList.add('dark');
+            } else {
+                document.documentElement.classList.remove('dark');
+            }
+        }
+
+        function toggleDarkMode() {
+            const currentlyDark = document.documentElement.classList.contains('dark');
+            const systemPrefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+            const newMode = !currentlyDark;
+            
+            // Only save to localStorage if different from system preference
+            if (newMode === systemPrefersDark) {
+                // User wants to follow system - remove override
+                localStorage.removeItem('darkMode');
+            } else {
+                // User wants to override system
+                localStorage.setItem('darkMode', newMode ? 'dark' : 'light');
+            }
+            
+            updateDarkMode();
+        }
+
+        // Initialize dark mode on page load
+        updateDarkMode();
+
+        // Listen for system preference changes
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', updateDarkMode);
+
+        // Add event listener for dark mode toggle
+        document.addEventListener('DOMContentLoaded', function() {
+            const toggleButton = document.getElementById('darkModeToggle');
+            if (toggleButton) {
+                toggleButton.addEventListener('click', toggleDarkMode);
             }
         });
     </script>
