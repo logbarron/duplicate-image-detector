@@ -849,7 +849,7 @@
 
                     <div class="image-container">
                         {% if image.exists %}
-                        <img src="data:image/jpeg;base64,{{ image.data }}" alt="{{ image.name }}">
+                        <img src="/image/{{ image.id }}" alt="{{ image.name }}">
                         {% else %}
                         <div class="missing-image">
                             <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">

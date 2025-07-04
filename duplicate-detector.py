@@ -80,7 +80,7 @@ from rich.table import Table
 from rich.live import Live
 from rich.text import Text
 
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify, send_file, Response
 from waitress import serve
 
 import pillow_heif
@@ -1678,9 +1678,9 @@ def index():
         image_path = Path(row['path'])
         
         image_info = {
+            'id': row['id'],
             'name': row['name'],
             'path': row['path'],
-            'data': None,
             'exists': image_path.exists() and row['status'] != 'missing',
             'is_representative': row['is_representative'],
             'sscd_score': row['sscd_score'],
@@ -1698,10 +1698,7 @@ def index():
                 pass
             
             if image_info['status'] == 'active':
-                thumb = create_thumbnail(image_path)
-                if thumb:
-                    image_info['data'] = thumb
-                    active_count += 1
+                active_count += 1
         
         if detection_method == 'unknown':
             detection_method = row['detection_method']
@@ -1881,6 +1878,47 @@ def previous_group():
                 break
     
     return index()
+
+
+@app.route('/image/<int:image_id>')
+def serve_image(image_id):
+    """Securely serves an image using its database ID"""
+    try:
+        with get_db_connection(app_state.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT path FROM images WHERE id = ?", (image_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return "Image not found", 404
+            
+            path = Path(row['path'])
+            if not path.exists():
+                return "Image file not found", 404
+            
+            # Generate thumbnail on-demand using existing function
+            thumb_data = create_thumbnail(path)
+            if not thumb_data:
+                return "Failed to generate thumbnail", 500
+                
+            # Convert base64 back to bytes for proper HTTP response
+            image_bytes = base64.b64decode(thumb_data)
+            
+            # Create response with proper headers
+            response = Response(
+                image_bytes,
+                mimetype='image/jpeg',
+                headers={
+                    'Cache-Control': 'public, max-age=3600',  # Cache for 1 hour
+                    'ETag': f'"{hash(str(path) + str(path.stat().st_mtime))}"'
+                }
+            )
+            
+            return response
+            
+    except Exception as e:
+        return f"Error serving image: {str(e)}", 500
+
 
 # ==============================================================================
 # Main Pipeline
