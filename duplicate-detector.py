@@ -36,7 +36,6 @@ import subprocess
 import atexit
 import gc
 import sqlite3
-import json
 import shutil
 import base64
 import webbrowser
