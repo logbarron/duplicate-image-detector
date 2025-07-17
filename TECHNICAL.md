@@ -6,7 +6,7 @@ The duplicate image detector is a self-contained Python script that operates in 
 
 ### Detection Pipeline
 
-1. **Image Scanning:** Recursively finds all images in the target directory
+1. **Image Scanning:** Finds all images in the specified directory (non-recursive)
 2. **Metadata Extraction:** Extracts EXIF data (timestamp, camera make/model) in parallel
 3. **Feature Extraction (ML Mode):** A PyTorch-based SSCD model (`sscd_disc_large`) generates a 1024-dimension feature vector for each image. Features are cached on disk for subsequent runs
 4. **Candidate Pairing:** A fast similarity search (dot product on normalized vectors) identifies potential duplicate pairs based on a configurable threshold
