@@ -13,8 +13,8 @@ A tool for finding duplicate and near-duplicate images. Then removing those file
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Clone repository
-git clone https://github.com/logbarron/duplicate-detector
-cd duplicate-image-detect
+git clone https://github.com/logbarron/duplicate-image-detector
+cd duplicate-image-detector
 
 # Make script executable
 chmod +x duplicate-detector.py
