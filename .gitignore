@@ -63,6 +63,7 @@ deleted_files_log.txt
 
 # Development/documentation files
 CLAUDE.md
+AGENTS.md
 
 # Logs
 *.log
