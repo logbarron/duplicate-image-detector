@@ -63,19 +63,26 @@ The duplicate image detector is a self-contained Python script that operates in 
 ### Advanced Configuration
 
 - `--sscd-threshold`: Similarity threshold for SSCD model (default: 0.86)
-- `--orb-features`: Maximum number of features for ORB geometric verification (default: 6000)
-- `--inlier-ratio`: Minimum inlier ratio for geometric match (default: 0.3)
 - `--workers`: Number of parallel workers for processing tasks (default: 11)
 - `--dataloader-workers`: Number of workers for PyTorch DataLoader (default: 8)
-- `--device`: PyTorch device (`cpu`, `cuda`, `mps`)
+
+**Note:** ORB features (6000), inlier ratio (0.3), and device (mps) are configured with hardcoded defaults in the Config class and cannot be changed via command-line arguments.
 
 ## Database Schema
 
-The SQLite database (`.duplicate_detector.db`) stores:
+The SQLite database (`.duplicate_detector.db`) contains two tables:
 
-- **Images table:** Image paths, metadata, group IDs, processing status
-- **Groups table:** Duplicate group information, scores, verification status
-- **Relationships:** Verified pairs and their similarity scores
+- **images table:** Stores all image data including:
+  - Basic info: id, path, name, resolution, status
+  - Group membership: group_id, is_representative
+  - Detection data: detection_method, sscd_score, geometric_inliers, metadata_bonus
+  - EXIF metadata: datetime_original, camera_make, camera_model, width, height
+  - Timestamps: created_at, updated_at, processing_time
+
+- **deletion_log table:** Audit log for deleted images
+  - Records: id, image_path, group_id, deleted_at
+
+**Note:** Groups are represented implicitly through the `group_id` column in the images table. Multiple images sharing the same `group_id` form a duplicate group. Similarity scores and verification data are stored directly in each image record.
 
 ## Performance Characteristics
 
@@ -101,7 +108,7 @@ project/
 ├── .duplicate_detector.db     # SQLite database (generated)
 ├── .duplicate_cache/          # Feature cache directory (generated)
 ├── deleted_files_log.txt      # Deletion log (generated)
-└── README.md                  # This file
+└── README.md                  # Project overview and usage guide
 ```
 
 ## Web API Endpoints
@@ -110,21 +117,21 @@ project/
 - `POST /delete`: Handles image deletion
 - `GET /next`: Navigate to next duplicate group
 - `GET /previous`: Navigate to previous duplicate group
-- `GET /thumbnails/<path>`: Serves image thumbnails
+- `GET /image/<int:image_id>`: Serves image thumbnails by database ID
 
 ## Troubleshooting
 
 ### Common Issues
 
 1. **Memory Issues:** Reduce batch size or number of workers
-2. **GPU Issues:** Fall back to CPU mode with `--device cpu`
+2. **GPU Issues:** Device selection is hardcoded (default: mps). Modify Config class if CPU-only mode is needed
 3. **Permission Issues:** Ensure read/write access to image directory
 4. **Port Conflicts:** Web UI uses port 5555 by default
 
 ### Performance Tuning
 
 - **Large Collections:** Increase `--workers` for more parallelism
-- **GPU Systems:** Use `--device cuda` or `--device mps`
+- **GPU Systems:** Device is hardcoded to mps. For CUDA, modify the Config class device parameter
 - **Storage:** Place cache on fast storage (SSD)
 - **Memory-Limited:** Reduce `--dataloader-workers` and batch sizes
 
