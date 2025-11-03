@@ -29,7 +29,7 @@ http://localhost:5555
 ## Image Pipeline
 
 ```bash
-1. Scan & Find Images
+1. Scan & Find Images (non-recursive)
 2. Extract Metadata
 3. Generate Neural ML Features
 4. Find Similar Pairs
