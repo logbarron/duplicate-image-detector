@@ -6,6 +6,8 @@
 
 A tool for finding duplicate and near-duplicate images. Then removing those files using a simple UI.
 
+Read the story on my personal website: [Small Software: Duplicate Detector](https://loganbarron.com/posts/2025-07-21-smallsoftware-duplicates/)
+
 ## Get started
 
 ```bash
