@@ -1,22 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   "torch",
-#   "torchvision",
-#   "numpy",
-#   "pillow",
-#   "pillow-heif",
-#   "psutil",
-#   "scikit-learn",
-#   "opencv-python",
-#   "rich",
-#   "humanize",
-#   "exifread",
-#   "flask",
-#   "waitress",
-# ]
-# ///
+#!/usr/bin/env -S uv run
 """
 Unified Duplicate Detector - Metadata + Neural Features with Integrated Review UI
 """
