@@ -12,7 +12,7 @@ The duplicate image detector is a self-contained Python script that operates in 
 4. **Candidate Pairing:** A fast similarity search (dot product on normalized vectors) identifies potential duplicate pairs based on a configurable threshold
 5. **Geometric Verification:** OpenCV is used to perform a robust check on candidate pairs. It extracts ORB features and uses a RANSAC-based homography check to confirm the images are geometrically consistent, filtering out false positives
 6. **Grouping:** A Disjoint Set Union (DSU) data structure is used to efficiently group images into sets of duplicates based on the verified pairs
-7. **Database Storage:** All identified duplicate groups and their members are stored in an SQLite database (`.duplicate_detector.db`)
+7. **Database Storage:** All identified duplicate groups and their members are stored in an SQLite database (`.duplicate-detector/db/detector.db`)
 
 ### Review UI
 
@@ -70,7 +70,7 @@ The duplicate image detector is a self-contained Python script that operates in 
 
 ## Database Schema
 
-The SQLite database (`.duplicate_detector.db`) contains two tables:
+The SQLite database (`.duplicate-detector/db/detector.db`) contains two tables:
 
 - **images table:** Stores all image data including:
   - Basic info: id, path, name, resolution, status
@@ -88,7 +88,7 @@ The SQLite database (`.duplicate_detector.db`) contains two tables:
 
 ### Speed Optimizations
 
-- **Feature Caching:** Neural features cached in `.duplicate_cache/` directory
+- **Feature Caching:** Neural features cached in `.duplicate-detector/cache/` directory
 - **Parallel Processing:** Multi-core processing for metadata extraction and geometric verification
 - **GPU Acceleration:** MPS (Apple Silicon) or CUDA support for neural network inference
 - **Batched Operations:** Efficient batch processing for large image collections
@@ -105,8 +105,14 @@ The SQLite database (`.duplicate_detector.db`) contains two tables:
 project/
 ├── duplicate-detector.py      # Main application
 ├── duplicate-detector-ui.html # Web UI template
-├── .duplicate_detector.db     # SQLite database (generated)
-├── .duplicate_cache/          # Feature cache directory (generated)
+├── pyproject.toml             # Project config and dev dependencies
+├── .duplicate-detector/       # Generated data directory
+│   ├── db/
+│   │   └── detector.db        # SQLite database
+│   ├── models/
+│   │   └── sscd_disc_large.torchscript.pt  # ML model (downloaded on first run)
+│   └── cache/
+│       └── features_*.npz     # Feature cache files
 ├── deleted_files_log.txt      # Deletion log (generated)
 └── README.md                  # Project overview and usage guide
 ```
@@ -152,9 +158,30 @@ The script uses PEP 723 inline dependencies and automatically installs:
 - `pillow` & `pillow-heif`: Image processing
 - `flask` & `waitress`: Web server
 - `rich`: Terminal output formatting
-- `numpy`, `scipy`, `scikit-learn`: Numerical computing
-- `pandas`: Data manipulation
-- `tqdm`: Progress bars
+- `numpy` & `scikit-learn`: Numerical computing
 - `psutil`: System resource monitoring
 - `humanize`: Human-readable formatting
 - `exifread`: EXIF metadata extraction
+
+## Development Setup
+
+For development with linting and type checking:
+
+```bash
+# Install all dependencies including dev tools
+uv sync --all-extras
+
+# Run linter
+uv run ruff check duplicate-detector.py
+
+# Run type checker
+uv run pyright duplicate-detector.py
+
+# Auto-fix lint issues
+uv run ruff check --fix duplicate-detector.py
+
+# Format code
+uv run ruff format duplicate-detector.py
+```
+
+Dev dependencies (ruff, pyright) are defined in `pyproject.toml` under `[project.optional-dependencies]`.

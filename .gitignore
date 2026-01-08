@@ -35,6 +35,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+uv.lock
 
 # IDEs
 .vscode/
@@ -53,12 +54,8 @@ ehthumbs.db
 Thumbs.db
 
 # Application-specific
-.duplicate_detector.db
-.duplicate_detector.db-shm
-.duplicate_detector.db-wal
-.duplicate_cache/
-*.torchscript.pt
-*.npz
+.duplicate-detector/
+.ruff_cache/
 deleted_files_log.txt
 
 # Development/documentation files

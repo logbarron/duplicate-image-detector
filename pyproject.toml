@@ -1,0 +1,51 @@
+[project]
+name = "duplicate-detector"
+version = "1.1.0"
+description = "Duplicate image detection using metadata and neural network features"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch",
+    "torchvision",
+    "numpy",
+    "pillow",
+    "pillow-heif",
+    "psutil",
+    "scikit-learn",
+    "opencv-python",
+    "rich",
+    "humanize",
+    "exifread",
+    "flask",
+    "waitress",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "pyright",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "SIM",    # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "E402",   # module level import not at top (intentional - mp.set_start_method must run first)
+]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
