@@ -1,7 +1,5 @@
 #!/usr/bin/env -S uv run
-"""
-Unified Duplicate Detector - Metadata + Neural Features with Integrated Review UI
-"""
+"""Unified Duplicate Detector - Metadata + Neural Features with Integrated Review UI."""
 
 import atexit
 import base64
@@ -21,15 +19,25 @@ import urllib.request
 import warnings
 import webbrowser
 from collections import OrderedDict, defaultdict
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from collections.abc import Generator
+from concurrent.futures import (
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+)
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import wraps
 from io import BytesIO
 from pathlib import Path
 from queue import Queue
-from typing import Any
+from types import FrameType, TracebackType
+from typing import Any, Generic, TypeVar
+
+K = TypeVar("K")
+V = TypeVar("V")
 
 mp.set_start_method("spawn", force=True)
 
@@ -59,11 +67,11 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 from rich.table import Table
-from sklearn.preprocessing import normalize
+from sklearn.preprocessing import normalize  # type: ignore[reportUnknownVariableType]
 from torch.utils.data import DataLoader, Dataset
 from waitress import serve
 
-pillow_heif.register_heif_opener()
+pillow_heif.register_heif_opener()  # type: ignore[reportUnknownMemberType]
 
 warnings.filterwarnings("ignore")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -72,28 +80,77 @@ console = Console()
 
 # Global flag for cleanup
 _cleanup_in_progress = False
-_active_dataloaders = []
+_active_dataloaders: list[Any] = []
 
 # Flask app - templates in current directory
 app = Flask(__name__, template_folder=".")
 
+# ==============================================================================
+# Constants
+# ==============================================================================
+
+# Minimum number of ORB descriptors required for geometric verification
+MIN_DESCRIPTORS = 10
+
+# Threshold for "large feature set" - affects inlier ratio requirements
+LARGE_FEATURE_THRESHOLD = 1000
+
+# Minimum number of images to form a valid duplicate group
+MIN_GROUP_SIZE = 2
+
+# Maximum entries in route cache before cleanup
+MAX_ROUTE_CACHE_ENTRIES = 100
+
+# kNN matching returns k=2 neighbors for Lowe's ratio test
+KNN_MATCH_COUNT = 2
+
+# String split for key=value pairs produces 2 parts
+KEY_VALUE_SPLIT_PARTS = 2
+
+# Datetime string needs at least date and time parts
+MIN_DATETIME_PARTS = 2
+
 
 # LRU caches with proper size limits
-class LRUCache:
-    def __init__(self, capacity):
-        self.cache = OrderedDict()
+class LRUCache(Generic[K, V]):
+    """Thread-safe LRU cache with configurable capacity."""
+
+    def __init__(self, capacity: int) -> None:
+        """Initialize the cache with given capacity.
+
+        Args:
+            capacity: Maximum number of items to store.
+
+        """
+        self.cache: OrderedDict[K, V] = OrderedDict()
         self.capacity = capacity
         # Thread safety lock for concurrent access
         self._lock = threading.Lock()
 
-    def get(self, key):
+    def get(self, key: K) -> V | None:
+        """Retrieve an item from the cache.
+
+        Args:
+            key: The key to look up.
+
+        Returns:
+            The cached value or None if not found.
+
+        """
         with self._lock:
             if key not in self.cache:
                 return None
             self.cache.move_to_end(key)
             return self.cache[key]
 
-    def put(self, key, value):
+    def put(self, key: K, value: V) -> None:
+        """Store an item in the cache.
+
+        Args:
+            key: The key to store under.
+            value: The value to store.
+
+        """
         with self._lock:
             if key in self.cache:
                 self.cache.move_to_end(key)
@@ -101,31 +158,50 @@ class LRUCache:
             if len(self.cache) > self.capacity:
                 self.cache.popitem(last=False)
 
-    def __contains__(self, key):
+    def __contains__(self, key: object) -> bool:
+        """Check if a key exists in the cache.
+
+        Args:
+            key: The key to check.
+
+        Returns:
+            True if the key exists, False otherwise.
+
+        """
         with self._lock:
             return key in self.cache
 
-    def clear(self):
+    def clear(self) -> None:
+        """Remove all items from the cache."""
         with self._lock:
             self.cache.clear()
 
-    def remove(self, key):
+    def remove(self, key: K) -> None:
+        """Remove a specific key from the cache.
+
+        Args:
+            key: The key to remove.
+
+        """
         with self._lock:
             self.cache.pop(key, None)
 
 
 # State management
 class AppState:
+    """Global application state for the web UI."""
+
     db_path: Path | None
     current_group_id: str | None
     initial_active_groups: list[str]
     active_groups_set: set[str]
-    thumbnail_cache: LRUCache
-    group_data_cache: LRUCache
+    thumbnail_cache: LRUCache[str, str]
+    group_data_cache: LRUCache[str, dict[str, Any]]
     total_groups_cache: int | None
     connection_pool: "ConnectionPool | None"
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize application state with default values."""
         self.db_path = None
         self.current_group_id = None
         self.initial_active_groups = []
@@ -137,12 +213,24 @@ class AppState:
         # Thread safety lock for concurrent access
         self._lock = threading.Lock()
 
-    def reset_groups(self):
+    def reset_groups(self) -> None:
+        """Reset group-related state to initial values."""
         with self._lock:
             self.current_group_id = None
             self.initial_active_groups = []
             self.active_groups_set = set()
             self.total_groups_cache = None
+
+    @contextmanager
+    def locked(self) -> Generator[None, None, None]:
+        """Acquire the state lock for thread-safe operations.
+
+        Yields:
+            None after acquiring the lock.
+
+        """
+        with self._lock:
+            yield
 
 
 app_state = AppState()
@@ -152,8 +240,13 @@ app_state = AppState()
 # ==============================================================================
 
 
-def init_database(db_path: Path):
-    """Initialize SQLite database with schema"""
+def init_database(db_path: Path) -> None:
+    """Initialize SQLite database with schema.
+
+    Args:
+        db_path: Path to the SQLite database file.
+
+    """
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -228,9 +321,15 @@ def init_database(db_path: Path):
 # ==============================================================================
 
 
-def signal_handler(signum, frame):
-    """Handle interrupt signals gracefully"""
-    global _cleanup_in_progress
+def signal_handler(_signum: int, _frame: FrameType | None) -> None:
+    """Handle interrupt signals gracefully.
+
+    Args:
+        _signum: Signal number received (unused).
+        _frame: Current stack frame (unused).
+
+    """
+    global _cleanup_in_progress  # noqa: PLW0603
     if not _cleanup_in_progress:
         _cleanup_in_progress = True
         console.print("\n[yellow]Received interrupt signal. Shutting down...[/yellow]")
@@ -239,10 +338,8 @@ def signal_handler(signum, frame):
         os._exit(0)
 
 
-def cleanup_resources():
-    """Clean up all resources"""
-    global _active_dataloaders
-
+def cleanup_resources() -> None:
+    """Clean up all resources including dataloaders and GPU cache."""
     # Only clean up if we have active resources
     if not _active_dataloaders and not torch.cuda.is_available():
         return
@@ -251,7 +348,7 @@ def cleanup_resources():
     for dataloader in _active_dataloaders:
         try:
             if hasattr(dataloader, "_iterator"):
-                del dataloader._iterator
+                del dataloader._iterator  # noqa: SLF001
             del dataloader
         except (AttributeError, TypeError):
             pass
@@ -282,7 +379,7 @@ atexit.register(cleanup_resources)
 
 @dataclass
 class Config:
-    """Configuration for enhanced duplicate detection"""
+    """Configuration for enhanced duplicate detection."""
 
     image_folder: Path = Path()
     base_dir: Path = Path(".duplicate-detector")
@@ -324,7 +421,8 @@ class Config:
     model_dir: Path = field(init=False)
     cache_dir: Path = field(init=False)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        """Set up computed paths and create directories."""
         # Set up directory structure under base_dir
         self.db_dir = self.base_dir / "db"
         self.model_dir = self.base_dir / "models"
@@ -339,7 +437,7 @@ class Config:
         self.db_path = self.db_dir / "detector.db"
 
     def get_cache_key(self) -> str:
-        """Generate a cache key based on configuration parameters"""
+        """Generate a cache key based on configuration parameters."""
         key_parts = [
             str(self.image_folder.absolute()),
             str(self.sscd_threshold),
@@ -350,9 +448,7 @@ class Config:
         ]
 
         key_string = "_".join(key_parts)
-        cache_key = hashlib.md5(key_string.encode()).hexdigest()[:16]
-
-        return cache_key
+        return hashlib.md5(key_string.encode(), usedforsecurity=False).hexdigest()[:16]
 
 
 # ==============================================================================
@@ -361,37 +457,40 @@ class Config:
 
 
 class MetadataExtractor:
-    """Extract and compare image metadata"""
+    """Extract and compare image metadata."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize the metadata extractor with an LRU cache."""
         # Use bounded LRUCache instead of unbounded dictionary to prevent memory leaks
-        self._cache = LRUCache(capacity=10000)
+        self._cache: LRUCache[tuple[str, float], dict[str, Any]] = LRUCache(capacity=10000)
 
-    def extract_metadata(self, image_path: Path) -> dict[str, Any]:
-        """Extract relevant metadata from image"""
-        # Check cache first
-        cache_key = (str(image_path), image_path.stat().st_mtime)
-        cached_metadata = self._cache.get(cache_key)
-        if cached_metadata is not None:
-            return cached_metadata.copy()
+    def _extract_image_dimensions(
+        self, image_path: Path, metadata: dict[str, Any]
+    ) -> None:
+        """Extract image dimensions using PIL.
 
-        metadata = {
-            "datetime_original": None,
-            "camera_make": None,
-            "camera_model": None,
-            "width": None,
-            "height": None,
-            "valid": False,
-        }
+        Args:
+            image_path: Path to the image file.
+            metadata: Metadata dict to update in place.
 
+        """
         try:
-            # Fast image info without loading full image
             with Image.open(image_path) as img:
                 metadata["width"] = img.width
                 metadata["height"] = img.height
         except (OSError, Image.DecompressionBombError) as e:
             print(f"Error getting dimensions for {image_path}: {e}")
 
+    def _extract_exifread_metadata(
+        self, image_path: Path, metadata: dict[str, Any]
+    ) -> None:
+        """Extract metadata using exifread library.
+
+        Args:
+            image_path: Path to the image file.
+            metadata: Metadata dict to update in place.
+
+        """
         try:
             with image_path.open("rb") as f:
                 tags = exifread.process_file(f, details=False, strict=False)
@@ -407,98 +506,190 @@ class MetadataExtractor:
                 if "Image Model" in tags:
                     metadata["camera_model"] = str(tags["Image Model"]).strip()
 
-        # exifread's HEIC parser may raise a plain AssertionError - catch it as well
+        # exifread's HEIC parser may raise AssertionError
         except (OSError, KeyError, AttributeError, AssertionError, exifread.core.heic.BadSize) as e:  # type: ignore[attr-defined]
             if isinstance(e, exifread.core.heic.BadSize):  # type: ignore[attr-defined]
                 print(f"Warning: Corrupted HEIC file detected: {image_path}")
 
-        if not metadata["datetime_original"] or not metadata["camera_make"]:
+    def _extract_pil_exif_metadata(
+        self, image_path: Path, metadata: dict[str, Any]
+    ) -> None:
+        """Extract EXIF metadata using PIL as fallback.
+
+        Args:
+            image_path: Path to the image file.
+            metadata: Metadata dict to update in place.
+
+        """
+        if metadata["datetime_original"] and metadata["camera_make"]:
+            return
+
+        try:
+            img = Image.open(image_path)
             try:
-                img = Image.open(image_path)
-
-                try:
-                    exif_data = img._getexif()  # type: ignore[attr-defined]
-                    if exif_data:
-                        for tag, value in exif_data.items():
-                            tag_name = TAGS.get(tag, tag)
-
-                            if tag_name == "DateTimeOriginal" and not metadata["datetime_original"]:
-                                metadata["datetime_original"] = str(value)
-                            elif tag_name == "Make" and not metadata["camera_make"]:
-                                metadata["camera_make"] = str(value).strip()
-                            elif tag_name == "Model" and not metadata["camera_model"]:
-                                metadata["camera_model"] = str(value).strip()
-                except AttributeError:
-                    pass
-                finally:
-                    img.close()
-
-            except Exception:
+                exif_data: dict[int, Any] | None = img._getexif()  # type: ignore[attr-defined]  # noqa: SLF001
+                if exif_data:
+                    self._parse_pil_exif_tags(exif_data, metadata)  # type: ignore[reportUnknownArgumentType]
+            except AttributeError:
                 pass
+            finally:
+                img.close()
+        except (OSError, ValueError, Image.DecompressionBombError):
+            pass
 
-        if not metadata["datetime_original"] or not metadata["camera_make"]:
-            try:
-                result = subprocess.run(
-                    [
-                        "mdls",
-                        "-name",
-                        "kMDItemContentCreationDate",
-                        "-name",
-                        "kMDItemAcquisitionMake",
-                        "-name",
-                        "kMDItemAcquisitionModel",
-                        str(image_path),
-                    ],
-                    capture_output=True,
-                    text=True,
-                )
+    def _parse_pil_exif_tags(
+        self, exif_data: dict[int, Any], metadata: dict[str, Any]
+    ) -> None:
+        """Parse EXIF tags from PIL exif data.
 
-                if result.returncode == 0:
-                    lines = result.stdout.strip().split("\n")
-                    for line in lines:
-                        if (
-                            "kMDItemContentCreationDate" in line
-                            and not metadata["datetime_original"]
-                        ):
-                            parts = line.split("=", 1)
-                            if len(parts) == 2:
-                                date_str = parts[1].strip()
-                                if date_str and date_str != "(null)":
-                                    date_str = date_str.strip('"')
-                                    date_parts = date_str.split(" ")
-                                    if len(date_parts) >= 2:
-                                        date = date_parts[0].replace("-", ":")
-                                        time = date_parts[1]
-                                        metadata["datetime_original"] = f"{date} {time}"
+        Args:
+            exif_data: Raw EXIF data from PIL.
+            metadata: Metadata dict to update in place.
 
-                        elif "kMDItemAcquisitionMake" in line and not metadata["camera_make"]:
-                            parts = line.split("=", 1)
-                            if len(parts) == 2:
-                                make = parts[1].strip().strip('"')
-                                if make and make != "(null)":
-                                    metadata["camera_make"] = make
+        """
+        for tag, value in exif_data.items():
+            tag_name = TAGS.get(tag, tag)
 
-                        elif "kMDItemAcquisitionModel" in line and not metadata["camera_model"]:
-                            parts = line.split("=", 1)
-                            if len(parts) == 2:
-                                model = parts[1].strip().strip('"')
-                                if model and model != "(null)":
-                                    metadata["camera_model"] = model
+            if tag_name == "DateTimeOriginal" and not metadata["datetime_original"]:
+                metadata["datetime_original"] = str(value)
+            elif tag_name == "Make" and not metadata["camera_make"]:
+                metadata["camera_make"] = str(value).strip()
+            elif tag_name == "Model" and not metadata["camera_model"]:
+                metadata["camera_model"] = str(value).strip()
 
-            except Exception:
-                pass
+    def _extract_macos_metadata(
+        self, image_path: Path, metadata: dict[str, Any]
+    ) -> None:
+        """Extract metadata using macOS mdls command.
+
+        Args:
+            image_path: Path to the image file.
+            metadata: Metadata dict to update in place.
+
+        """
+        if metadata["datetime_original"] and metadata["camera_make"]:
+            return
+
+        try:
+            result = subprocess.run(  # noqa: S603
+                [  # noqa: S607 - mdls is a macOS system utility
+                    "mdls",
+                    "-name", "kMDItemContentCreationDate",
+                    "-name", "kMDItemAcquisitionMake",
+                    "-name", "kMDItemAcquisitionModel",
+                    str(image_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            if result.returncode == 0:
+                self._parse_mdls_output(result.stdout, metadata)
+
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+    def _parse_mdls_output(self, output: str, metadata: dict[str, Any]) -> None:
+        """Parse mdls command output.
+
+        Args:
+            output: Raw output from mdls command.
+            metadata: Metadata dict to update in place.
+
+        """
+        for line in output.strip().split("\n"):
+            if "kMDItemContentCreationDate" in line and not metadata["datetime_original"]:
+                self._parse_mdls_datetime(line, metadata)
+            elif "kMDItemAcquisitionMake" in line and not metadata["camera_make"]:
+                self._parse_mdls_field(line, "camera_make", metadata)
+            elif "kMDItemAcquisitionModel" in line and not metadata["camera_model"]:
+                self._parse_mdls_field(line, "camera_model", metadata)
+
+    def _parse_mdls_datetime(self, line: str, metadata: dict[str, Any]) -> None:
+        """Parse datetime from mdls output line.
+
+        Args:
+            line: Single line from mdls output.
+            metadata: Metadata dict to update in place.
+
+        """
+        parts = line.split("=", 1)
+        if len(parts) != KEY_VALUE_SPLIT_PARTS:
+            return
+        date_str = parts[1].strip()
+        if not date_str or date_str == "(null)":
+            return
+        date_str = date_str.strip('"')
+        date_parts = date_str.split(" ")
+        if len(date_parts) >= MIN_DATETIME_PARTS:
+            date = date_parts[0].replace("-", ":")
+            time_val = date_parts[1]
+            metadata["datetime_original"] = f"{date} {time_val}"
+
+    def _parse_mdls_field(
+        self, line: str, field: str, metadata: dict[str, Any]
+    ) -> None:
+        """Parse a simple field from mdls output line.
+
+        Args:
+            line: Single line from mdls output.
+            field: Metadata field name to update.
+            metadata: Metadata dict to update in place.
+
+        """
+        parts = line.split("=", 1)
+        if len(parts) == KEY_VALUE_SPLIT_PARTS:
+            value = parts[1].strip().strip('"')
+            if value and value != "(null)":
+                metadata[field] = value
+
+    def extract_metadata(self, image_path: Path) -> dict[str, Any]:
+        """Extract relevant metadata from image.
+
+        Args:
+            image_path: Path to the image file.
+
+        Returns:
+            Dictionary containing metadata fields.
+
+        """
+        cache_key = (str(image_path), image_path.stat().st_mtime)
+        cached_metadata = self._cache.get(cache_key)
+        if cached_metadata is not None:
+            return cached_metadata.copy()
+
+        metadata: dict[str, Any] = {
+            "datetime_original": None,
+            "camera_make": None,
+            "camera_model": None,
+            "width": None,
+            "height": None,
+            "valid": False,
+        }
+
+        self._extract_image_dimensions(image_path, metadata)
+        self._extract_exifread_metadata(image_path, metadata)
+        self._extract_pil_exif_metadata(image_path, metadata)
+        self._extract_macos_metadata(image_path, metadata)
 
         if metadata["datetime_original"] and metadata["camera_make"]:
             metadata["valid"] = True
 
-        # Store in cache for future use
         self._cache.put(cache_key, metadata.copy())
-
         return metadata
 
     @staticmethod
     def create_metadata_key(metadata: dict[str, Any]) -> str | None:
-        """Create a unique key from metadata for comparison"""
+        """Create a unique key from metadata for comparison.
+
+        Args:
+            metadata: Metadata dictionary to create key from.
+
+        Returns:
+            String key or None if metadata is invalid.
+
+        """
         if not metadata["valid"]:
             return None
 
@@ -517,9 +708,10 @@ class MetadataExtractor:
 
 
 class SystemMonitor:
-    """Background system monitoring with proper cleanup"""
+    """Background system monitoring with proper cleanup."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize the system monitor and start background thread."""
         self.cpu_percent = 0.0
         self.memory_used = 0
         self.memory_total = psutil.virtual_memory().total
@@ -528,23 +720,31 @@ class SystemMonitor:
         self.thread = threading.Thread(target=self._monitor, daemon=True)
         self.thread.start()
 
-    def _monitor(self):
+    def _monitor(self) -> None:
+        """Background monitoring loop."""
         while self.running and not self._stop_event.is_set():
             try:
                 self.cpu_percent = psutil.cpu_percent(interval=0.1)
                 mem = psutil.virtual_memory()
                 self.memory_used = mem.used
                 self._stop_event.wait(0.5)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 break
 
-    def stop(self):
+    def stop(self) -> None:
+        """Stop the monitoring thread."""
         self.running = False
         self._stop_event.set()
         if self.thread.is_alive():
             self.thread.join(timeout=1.0)
 
     def get_status(self) -> str:
+        """Get formatted status string.
+
+        Returns:
+            Formatted string with CPU and memory usage.
+
+        """
         return (
             f"CPU: {self.cpu_percent:5.1f}% | "
             f"RAM: {humanize.naturalsize(self.memory_used)}/{humanize.naturalsize(self.memory_total)}"
@@ -557,10 +757,11 @@ class SystemMonitor:
 
 
 class ProgressManager:
-    """Centralized progress management with proper cleanup"""
+    """Centralized progress management with proper cleanup."""
 
-    def __init__(self):
-        self.progress = Progress(
+    def __init__(self) -> None:
+        """Initialize the progress manager with Rich progress bars."""
+        self.progress: Any = Progress(
             SpinnerColumn(),
             TextColumn("[bold blue]{task.description}"),
             BarColumn(),
@@ -570,32 +771,69 @@ class ProgressManager:
             console=console,
             expand=True,
         )
-        self.tasks = {}
+        self.tasks: dict[str, int] = {}
         self.system_monitor = SystemMonitor()
         self.start_time = time.time()
 
-    def __enter__(self):
+    def __enter__(self) -> "ProgressManager":
+        """Enter context manager."""
         self.progress.__enter__()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Exit context manager and clean up resources."""
         with contextlib.suppress(Exception):
             self.system_monitor.stop()
         self.progress.__exit__(exc_type, exc_val, exc_tb)
 
     def add_task(self, description: str, total: int) -> int:
-        task_id = self.progress.add_task(description, total=total)
+        """Add a new progress task.
+
+        Args:
+            description: Task description to display.
+            total: Total number of items.
+
+        Returns:
+            Task ID for updates.
+
+        """
+        task_id: int = self.progress.add_task(description, total=total)
         self.tasks[description] = task_id
         return task_id
 
-    def update(self, description: str, advance: int = 1):
+    def update(self, description: str, advance: int = 1) -> None:
+        """Update task progress.
+
+        Args:
+            description: Task description to update.
+            advance: Amount to advance by.
+
+        """
         if description in self.tasks:
             self.progress.advance(self.tasks[description], advance)
 
-    def log(self, message: str, style: str = ""):
+    def log(self, message: str, style: str = "") -> None:
+        """Log a message to the console.
+
+        Args:
+            message: Message to display.
+            style: Rich style to apply.
+
+        """
         self.progress.console.print(message, style=style)
 
-    def status_panel(self):
+    def status_panel(self) -> Any:  # noqa: ANN401 - Rich Panel type
+        """Create a status panel with system info.
+
+        Returns:
+            Rich Panel with system status.
+
+        """
         elapsed = time.time() - self.start_time
         return Panel(
             f"{self.system_monitor.get_status()}\nElapsed: {humanize.naturaldelta(elapsed)}",
@@ -610,7 +848,15 @@ class ProgressManager:
 
 
 def apply_color_normalization(image_array: np.ndarray) -> np.ndarray:
-    """YUV histogram equalization + CLAHE for photographed prints"""
+    """Apply YUV histogram equalization and CLAHE for photographed prints.
+
+    Args:
+        image_array: RGB image as numpy array.
+
+    Returns:
+        Normalized RGB image as numpy array.
+
+    """
     image_bgr = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
 
     img_yuv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2YUV)
@@ -627,22 +873,39 @@ def apply_color_normalization(image_array: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img_normalized, cv2.COLOR_BGR2RGB)
 
 
-class FastSSCDDataset(Dataset):
-    """Fast dataset for SSCD with color normalization and black padding"""
+class FastSSCDDataset(Dataset):  # type: ignore[type-arg]
+    """Fast dataset for SSCD with color normalization and black padding."""
 
-    def __init__(self, paths: list[Path], apply_color_norm: bool = True):
+    def __init__(self, paths: list[Path], *, apply_color_norm: bool = True) -> None:
+        """Initialize the dataset.
+
+        Args:
+            paths: List of image paths to process.
+            apply_color_norm: Whether to apply color normalization.
+
+        """
         self.paths = paths
         self.apply_color_norm = apply_color_norm
 
-        self.transform = T.Compose(
+        self.transform: Any = T.Compose(
             [T.ToTensor(), T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
         )
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Return the number of items in the dataset."""
         return len(self.paths)
 
-    def resize_with_padding(self, img: Image.Image, target_size: int = 288) -> Image.Image:
-        """Resize image to fit within target_size x target_size with black padding"""
+    def resize_with_padding(self, img: Any, target_size: int = 288) -> Any:  # noqa: ANN401
+        """Resize image to fit within target_size with black padding.
+
+        Args:
+            img: PIL Image to resize.
+            target_size: Target dimension for both width and height.
+
+        Returns:
+            Resized and padded PIL Image.
+
+        """
         orig_width, orig_height = img.size
 
         scale = min(target_size / orig_width, target_size / orig_height)
@@ -661,7 +924,16 @@ class FastSSCDDataset(Dataset):
 
         return canvas
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> tuple[Any, int]:
+        """Get a single item from the dataset.
+
+        Args:
+            idx: Index of the item to retrieve.
+
+        Returns:
+            Tuple of (transformed tensor, index).
+
+        """
         try:
             img = Image.open(self.paths[idx]).convert("RGB")
 
@@ -673,7 +945,7 @@ class FastSSCDDataset(Dataset):
             img = self.resize_with_padding(img, target_size=288)
             return self.transform(img), idx
 
-        except Exception:
+        except Exception:  # noqa: BLE001
             return torch.zeros(3, 288, 288), idx
 
 
@@ -683,17 +955,24 @@ class FastSSCDDataset(Dataset):
 
 
 class FastModelManager:
-    """Optimized model manager with single-pass extraction and cleanup"""
+    """Optimized model manager with single-pass extraction and cleanup."""
 
-    def __init__(self, config: Config, pm: ProgressManager):
+    def __init__(self, config: Config, pm: ProgressManager) -> None:
+        """Initialize the model manager.
+
+        Args:
+            config: Detection configuration.
+            pm: Progress manager for logging.
+
+        """
         self.config = config
         self.pm = pm
-        self.device = torch.device(config.device)
-        self.models = {}
-        self.dims = {}
+        self.device: Any = torch.device(config.device)
+        self.models: dict[str, Any] = {}
+        self.dims: dict[str, int] = {}
 
-    def load_models(self):
-        """Load SSCD disc_large"""
+    def load_models(self) -> None:
+        """Load SSCD disc_large model."""
         self.pm.log("[bold]Loading copy detection model...[/bold]")
 
         self.pm.log("Loading SSCD disc_large (1024-dim)...")
@@ -701,8 +980,8 @@ class FastModelManager:
 
         self.pm.log("[green]✓ Model loaded successfully[/green]")
 
-    def _load_sscd(self):
-        """Load SSCD disc_large"""
+    def _load_sscd(self) -> None:
+        """Load SSCD disc_large model from cache or download."""
         model_url = (
             "https://dl.fbaipublicfiles.com/sscd-copy-detection/sscd_disc_large.torchscript.pt"
         )
@@ -715,26 +994,26 @@ class FastModelManager:
                 "[bold blue]Downloading SSCD model", total=None, visible=True
             )
 
-            def download_hook(block_num, block_size, total_size):
+            def download_hook(block_num: int, block_size: int, total_size: int) -> None:
                 if self.pm.progress.tasks[download_task].total is None and total_size > 0:
                     self.pm.progress.update(download_task, total=total_size)
                 downloaded = block_num * block_size
                 self.pm.progress.update(download_task, completed=downloaded)
 
             try:
-                urllib.request.urlretrieve(model_url, cache_path, reporthook=download_hook)
+                urllib.request.urlretrieve(model_url, cache_path, reporthook=download_hook)  # noqa: S310
                 self.pm.progress.update(download_task, visible=False)
-            except Exception as e:
+            except Exception:
                 self.pm.progress.update(download_task, visible=False)
-                raise e
+                raise
 
-        model = torch.jit.load(cache_path, map_location="cpu")
-        self.models["sscd"] = model.to(self.device).eval()
+        model = torch.jit.load(cache_path, map_location="cpu")  # type: ignore[reportUnknownMemberType]
+        self.models["sscd"] = model.to(self.device).eval()  # type: ignore[reportUnknownMemberType]
         self.dims["sscd"] = 1024
         self.pm.log("[green]✓ SSCD loaded[/green]")
 
-    def cleanup(self):
-        """Clean up models and free memory"""
+    def cleanup(self) -> None:
+        """Clean up models and free memory."""
         for model in self.models.values():
             del model
         self.models.clear()
@@ -742,10 +1021,18 @@ class FastModelManager:
         if hasattr(torch, "mps") and torch.mps.is_available():
             torch.mps.empty_cache()
 
-    @torch.no_grad()
+    @torch.no_grad()  # type: ignore[reportUntypedFunctionDecorator]
     def extract_features_fast(self, image_paths: list[Path]) -> np.ndarray:
-        """Extract features using optimized pipeline with proper cleanup"""
-        global _active_dataloaders
+        """Extract features using optimized pipeline with proper cleanup.
+
+        Args:
+            image_paths: List of paths to images.
+
+        Returns:
+            Normalized feature array.
+
+        """
+        global _active_dataloaders  # noqa: PLW0602 - modifying global list
 
         n = len(image_paths)
         features = np.zeros((n, self.dims["sscd"]), dtype=np.float32)
@@ -760,7 +1047,7 @@ class FastModelManager:
 
         dataset = FastSSCDDataset(image_paths, apply_color_norm=True)
 
-        dataloader = DataLoader(
+        dataloader: DataLoader[tuple[Any, int]] = DataLoader(  # type: ignore[reportUnknownVariableType]
             dataset,
             batch_size=self.config.batch_size,
             num_workers=self.config.dataloader_workers,
@@ -778,8 +1065,8 @@ class FastModelManager:
                 if _cleanup_in_progress:
                     break
 
-                batch = batch.to(self.device)
-                batch_features = self.models["sscd"](batch)
+                batch_tensor = batch.to(self.device)
+                batch_features = self.models["sscd"](batch_tensor)
                 batch_features = F.normalize(batch_features, dim=1)
 
                 for i, idx in enumerate(indices):
@@ -794,10 +1081,10 @@ class FastModelManager:
         finally:
             try:
                 if hasattr(dataloader, "_iterator"):
-                    del dataloader._iterator
+                    del dataloader._iterator  # type: ignore[reportPrivateUsage]  # noqa: SLF001
                 _active_dataloaders.remove(dataloader)
                 del dataloader
-            except Exception:
+            except (RuntimeError, ValueError, AttributeError):
                 pass
             gc.collect()
 
@@ -815,72 +1102,111 @@ class FastModelManager:
 # Geometric Verification Worker (for ProcessPoolExecutor)
 # ==============================================================================
 
+# Maximum dimension for image resizing in geometric verification
+GV_MAX_IMAGE_DIM = 1500
 
-def geometric_verification_worker(candidate_data):
-    """Standalone worker function for geometric verification in separate processes"""
-    candidate, image_paths, config_params = candidate_data
 
-    path1 = image_paths[candidate["idx1"]]
-    path2 = image_paths[candidate["idx2"]]
+def _load_grayscale_images(
+    path1: Path, path2: Path
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Load and convert two images to grayscale arrays.
 
+    Args:
+        path1: Path to first image.
+        path2: Path to second image.
+
+    Returns:
+        Tuple of (img1, img2) as numpy arrays, or None on error.
+
+    """
     try:
-        # Use context managers to ensure images are closed even if errors occur
         with Image.open(path1) as pil_img1, Image.open(path2) as pil_img2:
-            # Convert to grayscale
-            pil_img1 = pil_img1.convert("L")
-            pil_img2 = pil_img2.convert("L")
+            gray1 = pil_img1.convert("L")
+            gray2 = pil_img2.convert("L")
+            return np.array(gray1), np.array(gray2)
+    except (OSError, ValueError, Image.DecompressionBombError):
+        return None
 
-            # Convert to numpy arrays
-            img1 = np.array(pil_img1)
-            img2 = np.array(pil_img2)
-    except Exception:
-        return False, candidate
 
-    max_dim = 1500
-    h1, w1 = img1.shape
-    if max(h1, w1) > max_dim:
-        scale = max_dim / max(h1, w1)
-        img1 = cv2.resize(img1, (int(w1 * scale), int(h1 * scale)))
+def _resize_if_needed(img: np.ndarray, max_dim: int = GV_MAX_IMAGE_DIM) -> np.ndarray:
+    """Resize image if it exceeds maximum dimension.
 
-    h2, w2 = img2.shape
-    if max(h2, w2) > max_dim:
-        scale = max_dim / max(h2, w2)
-        img2 = cv2.resize(img2, (int(w2 * scale), int(h2 * scale)))
+    Args:
+        img: Input grayscale image array.
+        max_dim: Maximum allowed dimension.
 
-    orb = cv2.ORB_create(  # type: ignore[attr-defined]
-        nfeatures=config_params["orb_nfeatures"],
-        scaleFactor=config_params["orb_scale_factor"],
-        nlevels=config_params["orb_nlevels"],
-    )
+    Returns:
+        Resized image array.
 
-    kp1, des1 = orb.detectAndCompute(img1, None)
-    kp2, des2 = orb.detectAndCompute(img2, None)
+    """
+    h, w = img.shape
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        return cv2.resize(img, (int(w * scale), int(h * scale)))  # type: ignore[return-value]
+    return img
 
-    if des1 is None or des2 is None or len(des1) < 10 or len(des2) < 10:
-        return False, candidate
 
+def _compute_good_matches(
+    des1: Any, des2: Any, lowe_ratio: float  # noqa: ANN401 - OpenCV types
+) -> list[Any]:
+    """Compute good matches using Lowe's ratio test.
+
+    Args:
+        des1: Descriptors from first image.
+        des2: Descriptors from second image.
+        lowe_ratio: Lowe's ratio threshold.
+
+    Returns:
+        List of good matches passing the ratio test.
+
+    """
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
     matches = bf.knnMatch(des1, des2, k=2)
 
-    good_matches = []
+    good_matches: list[Any] = []
     for match_pair in matches:
-        if len(match_pair) == 2:
+        if len(match_pair) == KNN_MATCH_COUNT:
             m, n = match_pair
-            if m.distance < config_params["lowe_ratio"] * n.distance:
+            if m.distance < lowe_ratio * n.distance:
                 good_matches.append(m)
+    return good_matches
 
-    if len(good_matches) < config_params["min_good_matches"]:
-        return False, candidate
 
+def _verify_homography(
+    good_matches: list[Any],
+    kp1: Any,  # noqa: ANN401 - OpenCV types
+    kp2: Any,  # noqa: ANN401 - OpenCV types
+    candidate: dict[str, Any],
+    config_params: dict[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    """Verify geometric consistency using homography.
+
+    Args:
+        good_matches: List of good feature matches.
+        kp1: Keypoints from first image.
+        kp2: Keypoints from second image.
+        candidate: Candidate duplicate dict.
+        config_params: Configuration parameters.
+
+    Returns:
+        Tuple of (is_valid, updated_candidate).
+
+    """
     src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)  # type: ignore[arg-type]
     dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)  # type: ignore[arg-type]
 
     homography, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
 
-    if homography is None:
+    if homography is None:  # type: ignore[reportUnnecessaryComparison]
         return False, candidate
 
     inliers = np.sum(mask)
+    min_features = min(len(kp1), len(kp2))
+    inlier_ratio = inliers / len(good_matches)
+    feature_coverage = inliers / min_features
+
+    if inliers < config_params["min_absolute_inliers"]:
+        return False, candidate
 
     has_metadata_bonus = candidate.get("has_metadata_bonus", False)
     required_ratio = (
@@ -889,25 +1215,16 @@ def geometric_verification_worker(candidate_data):
         else config_params["min_inlier_ratio"]
     )
 
-    min_features = min(len(kp1), len(kp2))
-    inlier_ratio = inliers / len(good_matches)
-    feature_coverage = inliers / min_features
-
-    if inliers < config_params["min_absolute_inliers"]:
-        return False, candidate
-
-    if min_features > 1000:
+    if min_features > LARGE_FEATURE_THRESHOLD:
         if feature_coverage < (required_ratio * 0.5):
             return False, candidate
-    else:
-        if inlier_ratio < required_ratio:
-            return False, candidate
+    elif inlier_ratio < required_ratio:
+        return False, candidate
 
     det = np.linalg.det(homography[:2, :2])
     if not (config_params["min_homography_det"] <= det <= config_params["max_homography_det"]):
         return False, candidate
 
-    # Update candidate with results
     candidate["geometric_inliers"] = int(inliers)
     candidate["inlier_ratio"] = float(inlier_ratio)
     candidate["feature_coverage"] = float(feature_coverage)
@@ -917,24 +1234,81 @@ def geometric_verification_worker(candidate_data):
     return True, candidate
 
 
+def geometric_verification_worker(
+    candidate_data: tuple[dict[str, Any], list[Path], dict[str, Any]],
+) -> tuple[bool, dict[str, Any]]:
+    """Perform geometric verification in a separate process.
+
+    Args:
+        candidate_data: Tuple of (candidate dict, image paths, config params).
+
+    Returns:
+        Tuple of (verification result, updated candidate dict).
+
+    """
+    candidate, image_paths, config_params = candidate_data
+
+    path1: Path = image_paths[candidate["idx1"]]  # type: ignore[reportUnknownVariableType]
+    path2: Path = image_paths[candidate["idx2"]]  # type: ignore[reportUnknownVariableType]
+
+    images = _load_grayscale_images(path1, path2)  # type: ignore[reportUnknownArgumentType]
+    if images is None:
+        return False, candidate
+    img1, img2 = images
+
+    img1 = _resize_if_needed(img1)
+    img2 = _resize_if_needed(img2)
+
+    orb = cv2.ORB_create(  # type: ignore[attr-defined]
+        nfeatures=config_params["orb_nfeatures"],
+        scaleFactor=config_params["orb_scale_factor"],
+        nlevels=config_params["orb_nlevels"],
+    )
+
+    kp1, des1 = orb.detectAndCompute(img1, None)  # type: ignore[reportUnknownMemberType]
+    kp2, des2 = orb.detectAndCompute(img2, None)  # type: ignore[reportUnknownMemberType]
+
+    if des1 is None or des2 is None or len(des1) < MIN_DESCRIPTORS or len(des2) < MIN_DESCRIPTORS:  # type: ignore[reportUnknownArgumentType]
+        return False, candidate
+
+    good_matches = _compute_good_matches(des1, des2, config_params["lowe_ratio"])
+
+    if len(good_matches) < config_params["min_good_matches"]:
+        return False, candidate
+
+    return _verify_homography(good_matches, kp1, kp2, candidate, config_params)
+
+
 # ==============================================================================
 # Duplicate Detection
 # ==============================================================================
 
 
 class DuplicateFinder:
-    """Find duplicates with metadata and/or neural features"""
+    """Find duplicates with metadata and/or neural features."""
 
-    def __init__(self, config: Config, pm: ProgressManager):
+    def __init__(self, config: Config, pm: ProgressManager) -> None:
+        """Initialize the duplicate finder.
+
+        Args:
+            config: Detection configuration.
+            pm: Progress manager for logging.
+
+        """
         self.config = config
         self.pm = pm
         self.metadata_extractor = MetadataExtractor()
-        self.all_metadata = {}
-        self.metadata_keys = {}
-        self.detailed_results = []  # Store detailed results
+        self.all_metadata: dict[int, dict[str, Any]] = {}
+        self.metadata_keys: dict[int, str | None] = {}
+        self.detailed_results: list[dict[str, Any]] = []
 
-    def extract_all_metadata(self, image_paths: list[Path]):
-        """Extract metadata for all images upfront"""
+    def extract_all_metadata(self, image_paths: list[Path]) -> None:
+        """Extract metadata for all images upfront.
+
+        Args:
+            image_paths: List of paths to images.
+
+        """
         self.pm.log("\n[bold cyan]Extracting metadata for all images[/bold cyan]")
         self.pm.log("[yellow]Using exifread + macOS mdls for better HEIC compatibility[/yellow]")
 
@@ -942,7 +1316,7 @@ class DuplicateFinder:
 
         # Parallel metadata extraction
         with ThreadPoolExecutor(max_workers=self.config.num_workers) as executor:
-            futures = {}
+            futures: dict[Future[dict[str, Any]], int] = {}
             for idx, path in enumerate(image_paths):
                 if _cleanup_in_progress:
                     break
@@ -970,19 +1344,27 @@ class DuplicateFinder:
         )
 
     def find_metadata_duplicates(self, image_paths: list[Path]) -> tuple[list[list[int]], set[int]]:
-        """Find duplicates based on metadata"""
+        """Find duplicates based on metadata.
+
+        Args:
+            image_paths: List of paths to images.
+
+        Returns:
+            Tuple of (duplicate groups, set of all duplicate indices).
+
+        """
         self.pm.log("\n[bold cyan]Finding metadata-based duplicates[/bold cyan]")
 
         if not self.all_metadata:
             self.extract_all_metadata(image_paths)
 
-        metadata_groups = defaultdict(list)
+        metadata_groups: defaultdict[str, list[int]] = defaultdict(list)
         for idx, metadata_key in self.metadata_keys.items():
             if metadata_key:
                 metadata_groups[metadata_key].append(idx)
 
-        duplicate_groups = []
-        all_duplicates = set()
+        duplicate_groups: list[list[int]] = []
+        all_duplicates: set[int] = set()
 
         for indices in metadata_groups.values():
             if len(indices) > 1:
@@ -1000,12 +1382,23 @@ class DuplicateFinder:
 
         return duplicate_groups, all_duplicates
 
-    def find_neural_candidates(self, features: np.ndarray, image_paths: list[Path]) -> list[dict]:
-        """Find candidates using neural features directly"""
+    def find_neural_candidates(
+        self, features: np.ndarray, image_paths: list[Path]
+    ) -> list[dict[str, Any]]:
+        """Find candidates using neural features directly.
+
+        Args:
+            features: Feature array from SSCD model.
+            image_paths: List of paths to images.
+
+        Returns:
+            List of candidate dictionaries.
+
+        """
         self.pm.log("\n[bold cyan]Finding neural candidates[/bold cyan]")
 
         n = len(image_paths)
-        candidates = []
+        candidates: list[dict[str, Any]] = []
 
         # Batch similarity computation
         batch_size = 1000
@@ -1044,12 +1437,21 @@ class DuplicateFinder:
 
     def find_integrated_candidates(
         self, features: np.ndarray, image_paths: list[Path]
-    ) -> list[dict]:
-        """Find candidates using integrated scoring (neural + metadata bonus)"""
+    ) -> list[dict[str, Any]]:
+        """Find candidates using integrated scoring (neural + metadata bonus).
+
+        Args:
+            features: Feature array from SSCD model.
+            image_paths: List of paths to images.
+
+        Returns:
+            List of candidate dictionaries with integrated scores.
+
+        """
         self.pm.log("\n[bold cyan]Finding candidates with integrated scoring[/bold cyan]")
 
         n = len(image_paths)
-        candidates = []
+        candidates: list[dict[str, Any]] = []
 
         if not self.all_metadata:
             self.extract_all_metadata(image_paths)
@@ -1127,85 +1529,84 @@ class DuplicateFinder:
 
         return candidates
 
-    def geometric_verification(self, candidate: dict, image_paths: list[Path]) -> bool:
-        """Verify with ORB+RANSAC using ratio-based thresholds"""
-        # Handle both index-based and direct path access
+    def _resolve_verification_paths(
+        self, candidate: dict[str, Any], image_paths: list[Path]
+    ) -> tuple[Path, Path] | None:
+        """Resolve paths for geometric verification.
+
+        Args:
+            candidate: Candidate duplicate pair.
+            image_paths: List of paths to images.
+
+        Returns:
+            Tuple of (path1, path2) or None if paths cannot be resolved.
+
+        """
         if "idx1" in candidate and "idx2" in candidate:
-            # Normal case: indices into image_paths
-            idx1, idx2 = candidate["idx1"], candidate["idx2"]
-            if idx1 >= len(image_paths) or idx2 >= len(image_paths):
-                # For cross-matches, paths are provided directly
-                path1 = image_paths[0] if len(image_paths) > 0 else None
-                path2 = image_paths[1] if len(image_paths) > 1 else None
-            else:
-                path1 = image_paths[idx1]
-                path2 = image_paths[idx2]
-        else:
-            # Direct path case
-            path1 = image_paths[0] if len(image_paths) > 0 else None
-            path2 = image_paths[1] if len(image_paths) > 1 else None
+            idx1: int = candidate["idx1"]
+            idx2: int = candidate["idx2"]
+            if idx1 < len(image_paths) and idx2 < len(image_paths):
+                return image_paths[idx1], image_paths[idx2]
+            if len(image_paths) >= MIN_GROUP_SIZE:
+                return image_paths[0], image_paths[1]
+        elif len(image_paths) >= MIN_GROUP_SIZE:
+            return image_paths[0], image_paths[1]
+        return None
 
-        if path1 is None or path2 is None:
-            return False
+    def _compute_orb_features(
+        self, img1: np.ndarray, img2: np.ndarray
+    ) -> tuple[Any, Any, Any, Any] | None:
+        """Compute ORB features for two images.
 
-        try:
-            # Use context managers to ensure images are closed even if errors occur
-            with Image.open(path1) as pil_img1, Image.open(path2) as pil_img2:
-                # Convert to grayscale
-                pil_img1 = pil_img1.convert("L")
-                pil_img2 = pil_img2.convert("L")
+        Args:
+            img1: First grayscale image.
+            img2: Second grayscale image.
 
-                # Convert to numpy arrays
-                img1 = np.array(pil_img1)
-                img2 = np.array(pil_img2)
-        except Exception:
-            return False
+        Returns:
+            Tuple of (kp1, des1, kp2, des2) or None if insufficient features.
 
-        max_dim = 1500
-        h1, w1 = img1.shape
-        if max(h1, w1) > max_dim:
-            scale = max_dim / max(h1, w1)
-            img1 = cv2.resize(img1, (int(w1 * scale), int(h1 * scale)))
-
-        h2, w2 = img2.shape
-        if max(h2, w2) > max_dim:
-            scale = max_dim / max(h2, w2)
-            img2 = cv2.resize(img2, (int(w2 * scale), int(h2 * scale)))
-
+        """
         orb = cv2.ORB_create(  # type: ignore[attr-defined]
             nfeatures=self.config.orb_nfeatures,
             scaleFactor=self.config.orb_scale_factor,
             nlevels=self.config.orb_nlevels,
         )
+        kp1, des1 = orb.detectAndCompute(img1, None)  # type: ignore[reportUnknownMemberType]
+        kp2, des2 = orb.detectAndCompute(img2, None)  # type: ignore[reportUnknownMemberType]
 
-        kp1, des1 = orb.detectAndCompute(img1, None)
-        kp2, des2 = orb.detectAndCompute(img2, None)
+        if des1 is None or des2 is None or len(des1) < MIN_DESCRIPTORS or len(des2) < MIN_DESCRIPTORS:  # type: ignore[reportUnknownArgumentType]
+            return None
+        return kp1, des1, kp2, des2  # type: ignore[reportUnknownVariableType]
 
-        if des1 is None or des2 is None or len(des1) < 10 or len(des2) < 10:
-            return False
+    def _verify_homography_internal(
+        self, good_matches: list[Any], kp1: Any, kp2: Any, candidate: dict[str, Any]  # noqa: ANN401
+    ) -> bool:
+        """Verify geometric consistency and update candidate.
 
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-        matches = bf.knnMatch(des1, des2, k=2)
+        Args:
+            good_matches: List of good feature matches.
+            kp1: Keypoints from first image.
+            kp2: Keypoints from second image.
+            candidate: Candidate dict to update.
 
-        good_matches = []
-        for match_pair in matches:
-            if len(match_pair) == 2:
-                m, n = match_pair
-                if m.distance < self.config.lowe_ratio * n.distance:
-                    good_matches.append(m)
+        Returns:
+            True if verification passes.
 
-        if len(good_matches) < self.config.min_good_matches:
-            return False
-
+        """
         src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)  # type: ignore[arg-type]
         dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)  # type: ignore[arg-type]
 
         homography, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-
-        if homography is None:
+        if homography is None:  # type: ignore[reportUnnecessaryComparison]
             return False
 
         inliers = np.sum(mask)
+        min_features = min(len(kp1), len(kp2))
+        inlier_ratio = inliers / len(good_matches)
+        feature_coverage = inliers / min_features
+
+        if inliers < self.config.min_absolute_inliers:
+            return False
 
         has_metadata_bonus = candidate.get("has_metadata_bonus", False)
         required_ratio = (
@@ -1214,19 +1615,11 @@ class DuplicateFinder:
             else self.config.min_inlier_ratio
         )
 
-        min_features = min(len(kp1), len(kp2))
-        inlier_ratio = inliers / len(good_matches)
-        feature_coverage = inliers / min_features
-
-        if inliers < self.config.min_absolute_inliers:
-            return False
-
-        if min_features > 1000:
+        if min_features > LARGE_FEATURE_THRESHOLD:
             if feature_coverage < (required_ratio * 0.5):
                 return False
-        else:
-            if inlier_ratio < required_ratio:
-                return False
+        elif inlier_ratio < required_ratio:
+            return False
 
         det = np.linalg.det(homography[:2, :2])
         if not (self.config.min_homography_det <= det <= self.config.max_homography_det):
@@ -1237,65 +1630,51 @@ class DuplicateFinder:
         candidate["feature_coverage"] = float(feature_coverage)
         candidate["good_matches"] = len(good_matches)
         candidate["min_features"] = int(min_features)
-
         return True
 
-    def find_ml_duplicates(
-        self,
-        features: np.ndarray,
-        image_paths: list[Path],
-        exclude_indices: set[int] | None = None,
-        mode: str = "ml",
-    ) -> list[list[int]]:
-        """Complete ML duplicate detection pipeline"""
-        if exclude_indices is None:
-            exclude_indices = set()
+    def geometric_verification(
+        self, candidate: dict[str, Any], image_paths: list[Path]
+    ) -> bool:
+        """Verify with ORB+RANSAC using ratio-based thresholds.
 
-        # Debug logging for incremental detection
-        self.pm.log(
-            f"[dim]Debug: features.shape={features.shape}, len(image_paths)={len(image_paths)}, exclude_indices={exclude_indices}[/dim]"
-        )
+        Args:
+            candidate: Candidate duplicate pair to verify.
+            image_paths: List of paths to images.
 
-        # Ensure indices are within bounds of both features and image_paths
-        max_valid_index = min(len(image_paths), len(features)) - 1
-        valid_indices = [
-            i for i in range(len(image_paths)) if i not in exclude_indices and i <= max_valid_index
-        ]
+        Returns:
+            True if verification passes, False otherwise.
 
-        if not valid_indices:
-            return []
+        """
+        paths = self._resolve_verification_paths(candidate, image_paths)
+        if paths is None:
+            return False
 
-        idx_map = dict(enumerate(valid_indices))
-        {old_idx: new_idx for new_idx, old_idx in idx_map.items()}
+        images = _load_grayscale_images(paths[0], paths[1])
+        if images is None:
+            return False
 
-        filtered_features = features[valid_indices]
-        filtered_paths = [image_paths[i] for i in valid_indices]
+        img1 = _resize_if_needed(images[0])
+        img2 = _resize_if_needed(images[1])
 
-        if mode == "integrated":
-            neural_candidates = self.find_integrated_candidates(filtered_features, filtered_paths)
-            # Map filtered indices back to original indices
-            for candidate in neural_candidates:
-                candidate["orig_idx1"] = idx_map[candidate["idx1"]]
-                candidate["orig_idx2"] = idx_map[candidate["idx2"]]
-        else:
-            neural_candidates = self.find_neural_candidates(filtered_features, filtered_paths)
-            for candidate in neural_candidates:
-                candidate["orig_idx1"] = idx_map[candidate["idx1"]]
-                candidate["orig_idx2"] = idx_map[candidate["idx2"]]
+        features = self._compute_orb_features(img1, img2)
+        if features is None:
+            return False
+        kp1, des1, kp2, des2 = features
 
-        self.pm.log("\n[bold cyan]Geometric verification[/bold cyan]")
-        self.pm.log(
-            f"[dim]Using ratio-based thresholds: {self.config.min_inlier_ratio:.0%} (normal), "
-            f"{self.config.min_inlier_ratio_metadata:.0%} (metadata match)[/dim]"
-        )
-        self.pm.log(f"[dim]Minimum absolute inliers: {self.config.min_absolute_inliers}[/dim]")
+        good_matches = _compute_good_matches(des1, des2, self.config.lowe_ratio)
+        if len(good_matches) < self.config.min_good_matches:
+            return False
 
-        final_verified = []
+        return self._verify_homography_internal(good_matches, kp1, kp2, candidate)
 
-        self.pm.add_task("Geometric verification", total=len(neural_candidates))
+    def _get_config_params(self) -> dict[str, Any]:
+        """Get configuration parameters for worker processes.
 
-        # Extract config parameters for worker processes
-        config_params = {
+        Returns:
+            Dictionary of configuration parameters.
+
+        """
+        return {
             "orb_nfeatures": self.config.orb_nfeatures,
             "orb_scale_factor": self.config.orb_scale_factor,
             "orb_nlevels": self.config.orb_nlevels,
@@ -1308,85 +1687,153 @@ class DuplicateFinder:
             "max_homography_det": self.config.max_homography_det,
         }
 
-        # Calculate worker count (75% of CPU cores)
+    def _run_parallel_verification(
+        self,
+        neural_candidates: list[dict[str, Any]],
+        image_paths: list[Path],
+        config_params: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Run parallel geometric verification on candidates.
+
+        Args:
+            neural_candidates: List of candidate pairs.
+            image_paths: List of image paths.
+            config_params: Configuration parameters.
+
+        Returns:
+            List of verified candidates.
+
+        """
         import multiprocessing as mp
 
         worker_count = max(1, int(mp.cpu_count() * 0.75))
+        final_verified: list[dict[str, Any]] = []
 
-        # Parallel geometric verification
         with ProcessPoolExecutor(max_workers=worker_count) as executor:
-            futures = {}
-
+            futures: dict[Future[tuple[bool, dict[str, Any]]], dict[str, Any]] = {}
             for candidate in neural_candidates:
                 if _cleanup_in_progress:
                     break
-
                 temp_candidate = {
                     "idx1": candidate["orig_idx1"],
                     "idx2": candidate["orig_idx2"],
                     "sscd_similarity": candidate["sscd_similarity"],
                     "has_metadata_bonus": candidate.get("has_metadata_bonus", False),
                 }
-
-                candidate_data = (temp_candidate, image_paths, config_params)
-                future = executor.submit(geometric_verification_worker, candidate_data)
+                future = executor.submit(
+                    geometric_verification_worker, (temp_candidate, image_paths, config_params)
+                )
                 futures[future] = candidate
 
             for future in as_completed(futures):
                 if _cleanup_in_progress:
                     break
-
                 candidate = futures[future]
-                success, updated_candidate = future.result()
+                success, updated = future.result()
                 if success:
-                    candidate["geometric_inliers"] = updated_candidate["geometric_inliers"]
-                    candidate["inlier_ratio"] = updated_candidate.get("inlier_ratio", 0)
-                    candidate["feature_coverage"] = updated_candidate.get("feature_coverage", 0)
-                    candidate["good_matches"] = updated_candidate.get("good_matches", 0)
-                    candidate["min_features"] = updated_candidate.get("min_features", 0)
+                    candidate["geometric_inliers"] = updated["geometric_inliers"]
+                    candidate["inlier_ratio"] = updated.get("inlier_ratio", 0)
+                    candidate["feature_coverage"] = updated.get("feature_coverage", 0)
+                    candidate["good_matches"] = updated.get("good_matches", 0)
+                    candidate["min_features"] = updated.get("min_features", 0)
                     final_verified.append(candidate)
                 self.pm.update("Geometric verification")
+
+        return final_verified
+
+    def _form_duplicate_groups(
+        self, verified: list[dict[str, Any]], valid_indices: list[int], n: int
+    ) -> list[list[int]]:
+        """Form duplicate groups using union-find.
+
+        Args:
+            verified: List of verified candidate pairs.
+            valid_indices: List of valid image indices.
+            n: Total number of images.
+
+        Returns:
+            List of duplicate groups.
+
+        """
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            if parent[x] != x:
+                parent[x] = find(parent[x])
+            return parent[x]
+
+        def union(x: int, y: int) -> None:
+            px, py = find(x), find(y)
+            if px != py:
+                parent[px] = py
+
+        for candidate in verified:
+            union(candidate["orig_idx1"], candidate["orig_idx2"])
+
+        groups_dict: dict[int, list[int]] = defaultdict(list)
+        for i in valid_indices:
+            groups_dict[find(i)].append(i)
+
+        return [members for members in groups_dict.values() if len(members) > 1]
+
+    def find_ml_duplicates(
+        self,
+        features: np.ndarray,
+        image_paths: list[Path],
+        exclude_indices: set[int] | None = None,
+        mode: str = "ml",
+    ) -> list[list[int]]:
+        """Complete ML duplicate detection pipeline.
+
+        Args:
+            features: Feature array from SSCD model.
+            image_paths: List of paths to images.
+            exclude_indices: Set of indices to exclude from detection.
+            mode: Detection mode ('ml' or 'integrated').
+
+        Returns:
+            List of duplicate groups (each group is a list of indices).
+
+        """
+        if exclude_indices is None:
+            exclude_indices = set()
+
+        max_valid_index = min(len(image_paths), len(features)) - 1
+        valid_indices = [
+            i for i in range(len(image_paths)) if i not in exclude_indices and i <= max_valid_index
+        ]
+        if not valid_indices:
+            return []
+
+        idx_map = dict(enumerate(valid_indices))
+        filtered_features = features[valid_indices]
+        filtered_paths = [image_paths[i] for i in valid_indices]
+
+        if mode == "integrated":
+            neural_candidates = self.find_integrated_candidates(filtered_features, filtered_paths)
+        else:
+            neural_candidates = self.find_neural_candidates(filtered_features, filtered_paths)
+
+        for candidate in neural_candidates:
+            candidate["orig_idx1"] = idx_map[candidate["idx1"]]
+            candidate["orig_idx2"] = idx_map[candidate["idx2"]]
+
+        self.pm.log("\n[bold cyan]Geometric verification[/bold cyan]")
+        self.pm.add_task("Geometric verification", total=len(neural_candidates))
+
+        config_params = self._get_config_params()
+        final_verified = self._run_parallel_verification(
+            neural_candidates, image_paths, config_params
+        )
 
         self.pm.log(
             f"[green]✓ Geometrically verified {len(final_verified)}/{len(neural_candidates)} pairs[/green]"
         )
 
-        if final_verified:
-            avg_inliers = np.mean([c["geometric_inliers"] for c in final_verified])
-            avg_ratio = np.mean([c["inlier_ratio"] for c in final_verified])
-            avg_coverage = np.mean([c["feature_coverage"] for c in final_verified])
-            self.pm.log(
-                f"[dim]Average inliers: {avg_inliers:.0f}, "
-                f"inlier ratio: {avg_ratio:.1%}, "
-                f"feature coverage: {avg_coverage:.1%}[/dim]"
-            )
-
         self.pm.log("\n[bold cyan]Forming duplicate groups...[/bold cyan]")
-        n = len(image_paths)
-        parent = list(range(n))
-
-        def find(x):
-            if parent[x] != x:
-                parent[x] = find(parent[x])
-            return parent[x]
-
-        def union(x, y):
-            px, py = find(x), find(y)
-            if px != py:
-                parent[px] = py
-
-        for candidate in final_verified:
-            union(candidate["orig_idx1"], candidate["orig_idx2"])
-
-        groups_dict = defaultdict(list)
-        for i in valid_indices:
-            root = find(i)
-            groups_dict[root].append(i)
-
-        groups = [members for members in groups_dict.values() if len(members) > 1]
+        groups = self._form_duplicate_groups(final_verified, valid_indices, len(image_paths))
 
         self.detailed_results = final_verified
-
         self.pm.log(f"[green]✓ Found {len(groups)} {mode.upper()} duplicate groups[/green]")
 
         return groups
@@ -1398,9 +1845,18 @@ class DuplicateFinder:
 
 
 class ConnectionPool:
-    def __init__(self, db_path, pool_size=5):
+    """SQLite connection pool for concurrent database access."""
+
+    def __init__(self, db_path: Path, pool_size: int = 5) -> None:
+        """Initialize the connection pool.
+
+        Args:
+            db_path: Path to the SQLite database.
+            pool_size: Number of connections to maintain.
+
+        """
         self.db_path = db_path
-        self.pool = Queue(maxsize=pool_size)
+        self.pool: Queue[sqlite3.Connection] = Queue(maxsize=pool_size)
         self._lock = threading.Lock()
 
         # Initialize pool
@@ -1415,7 +1871,13 @@ class ConnectionPool:
             self.pool.put(conn)
 
     @contextmanager
-    def get_connection(self):
+    def get_connection(self) -> Any:  # noqa: ANN401 - Generator type
+        """Get a connection from the pool.
+
+        Yields:
+            SQLite connection.
+
+        """
         conn = self.pool.get()
         try:
             yield conn
@@ -1424,8 +1886,16 @@ class ConnectionPool:
 
 
 @contextmanager
-def get_db_connection(db_path: Path):
-    """Context manager for database connections"""
+def get_db_connection(db_path: Path) -> Any:  # noqa: ANN401 - Generator type
+    """Get a database connection from the pool.
+
+    Args:
+        db_path: Path to the SQLite database.
+
+    Yields:
+        SQLite connection.
+
+    """
     if app_state.connection_pool is None:
         app_state.connection_pool = ConnectionPool(db_path)
 
@@ -1433,167 +1903,199 @@ def get_db_connection(db_path: Path):
         yield conn
 
 
-def save_results_to_db(
+def _prepare_metadata_batch(
+    metadata_groups: list[list[int]],
+    image_paths: list[Path],
+    finder: DuplicateFinder,
+) -> list[tuple[Any, ...]]:
+    """Prepare batch data for metadata groups.
+
+    Args:
+        metadata_groups: List of metadata duplicate groups.
+        image_paths: List of image paths.
+        finder: DuplicateFinder with metadata.
+
+    Returns:
+        List of tuples for database insertion.
+
+    """
+    batch_data: list[tuple[Any, ...]] = []
+    for group_id, group_members in enumerate(metadata_groups, 1):
+        for member in group_members:
+            metadata = finder.all_metadata.get(member, {})
+            width = metadata.get("width", 0)
+            height = metadata.get("height", 0)
+            resolution = f"{width}x{height}" if width and height else "unknown"
+            batch_data.append((
+                str(image_paths[member].absolute()),
+                image_paths[member].name,
+                f"META_{group_id}",
+                member == group_members[0],
+                "metadata",
+                1.0, 0, False,
+                resolution, "active",
+                metadata.get("datetime_original"),
+                metadata.get("camera_make"),
+                metadata.get("camera_model"),
+                width, height,
+            ))
+    return batch_data
+
+
+def _get_member_details(member: int, finder: DuplicateFinder) -> dict[str, Any] | None:
+    """Get best matching details for a member.
+
+    Args:
+        member: Member index.
+        finder: DuplicateFinder instance.
+
+    Returns:
+        Best matching result details or None.
+
+    """
+    member_details = None
+    for result in finder.detailed_results:
+        if result["orig_idx1"] != member and result["orig_idx2"] != member:
+            continue
+        if member_details is None or result.get(
+            "integrated_score", result["sscd_similarity"]
+        ) > member_details.get("integrated_score", member_details["sscd_similarity"]):
+            member_details = result
+    return member_details
+
+
+def _prepare_ml_batch(
+    ml_groups: list[list[int]],
+    image_paths: list[Path],
+    finder: DuplicateFinder,
+    mode: str,
+) -> list[tuple[Any, ...]]:
+    """Prepare batch data for ML groups.
+
+    Args:
+        ml_groups: List of ML duplicate groups.
+        image_paths: List of image paths.
+        finder: DuplicateFinder with metadata.
+        mode: Detection mode.
+
+    Returns:
+        List of tuples for database insertion.
+
+    """
+    detection_mode = "integrated" if mode == "integrated" else "ml"
+    ml_batch_data: list[tuple[Any, ...]] = []
+
+    for group_id, group_members in enumerate(ml_groups, 1):
+        member_scores: dict[int, float] = {}
+        for member in group_members:
+            scores = [
+                result.get("integrated_score", result["sscd_similarity"])
+                for result in finder.detailed_results
+                if result["orig_idx1"] == member or result["orig_idx2"] == member
+            ]
+            if scores:
+                member_scores[member] = float(np.mean(scores))
+
+        best_rep = max(member_scores, key=lambda k: member_scores[k]) if member_scores else group_members[0]
+
+        for member in group_members:
+            member_details = _get_member_details(member, finder)
+            detection_method = "ml"
+            if mode == "integrated" and member_details and member_details.get("has_metadata_bonus", False):
+                detection_method = "ml+metadata"
+
+            metadata = finder.all_metadata.get(member, {})
+            width = metadata.get("width", 0)
+            height = metadata.get("height", 0)
+            resolution = f"{width}x{height}" if width and height else "unknown"
+
+            ml_batch_data.append((
+                str(image_paths[member].absolute()),
+                image_paths[member].name,
+                f"{detection_mode.upper()}_{group_id}",
+                member == best_rep,
+                detection_method,
+                member_details["sscd_similarity"] if member_details else 0,
+                member_details.get("geometric_inliers", 0) if member_details else 0,
+                member_details.get("has_metadata_bonus", False) if member_details else False,
+                resolution, "active",
+                metadata.get("datetime_original"),
+                metadata.get("camera_make"),
+                metadata.get("camera_model"),
+                width, height,
+            ))
+
+    return ml_batch_data
+
+
+def save_results_to_db(  # noqa: PLR0913 - database save with all results
     config: Config,
     image_paths: list[Path],
     finder: DuplicateFinder,
     metadata_groups: list[list[int]],
     ml_groups: list[list[int]],
-    exclude_indices: set[int],
+    exclude_indices: set[int],  # noqa: ARG001
     mode: str,
-    features: np.ndarray | None = None,
-):
-    """Save detection results to database - simpler approach"""
+    features: np.ndarray | None = None,  # noqa: ARG001
+) -> None:
+    """Save detection results to database.
+
+    Args:
+        config: Detection configuration.
+        image_paths: List of paths to images.
+        finder: DuplicateFinder instance with metadata.
+        metadata_groups: List of metadata duplicate groups.
+        ml_groups: List of ML duplicate groups.
+        exclude_indices: Set of indices to exclude (unused, kept for API compatibility).
+        mode: Detection mode used.
+        features: Optional feature array (unused, kept for API compatibility).
+
+    """
     with get_db_connection(config.db_path) as conn:
         cursor = conn.cursor()
 
-        # Clear existing data for this folder - use exact path matching to avoid deleting unrelated data
         folder_path = str(config.image_folder.absolute())
-        # Ensure path ends with separator for safe matching
-        if not folder_path.endswith(os.sep):
-            folder_path_with_sep = folder_path + os.sep
-        else:
-            folder_path_with_sep = folder_path
-
-        # Delete only files in this exact folder and its subdirectories
-        # This prevents deleting from folders like '/photos2' when scanning '/photos'
+        folder_path_with_sep = folder_path if folder_path.endswith(os.sep) else folder_path + os.sep
         cursor.execute(
-            """
-            DELETE FROM images
-            WHERE path = ? OR path LIKE ?
-        """,
+            "DELETE FROM images WHERE path = ? OR path LIKE ?",
             (folder_path, f"{folder_path_with_sep}%"),
         )
 
-        # Prepare batch data
-        batch_data = []
-
-        # Process metadata groups
-        for group_id, group_members in enumerate(metadata_groups, 1):
-            for member in group_members:
-                metadata = finder.all_metadata.get(member, {})
-                width = metadata.get("width", 0)
-                height = metadata.get("height", 0)
-                resolution = f"{width}x{height}" if width and height else "unknown"
-
-                batch_data.append(
-                    (
-                        str(image_paths[member].absolute()),
-                        image_paths[member].name,
-                        f"META_{group_id}",
-                        member == group_members[0],
-                        "metadata",
-                        1.0,
-                        0,
-                        False,
-                        resolution,
-                        "active",
-                        metadata.get("datetime_original"),
-                        metadata.get("camera_make"),
-                        metadata.get("camera_model"),
-                        width,
-                        height,
-                    )
-                )
-
-        # Batch insert
+        batch_data = _prepare_metadata_batch(metadata_groups, image_paths, finder)
         cursor.executemany(
-            """
-            INSERT INTO images (path, name, group_id, is_representative,
-                              detection_method, sscd_score, geometric_inliers,
-                              metadata_bonus, resolution, status,
-                              datetime_original, camera_make, camera_model,
-                              width, height)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
+            """INSERT INTO images (path, name, group_id, is_representative,
+                detection_method, sscd_score, geometric_inliers, metadata_bonus,
+                resolution, status, datetime_original, camera_make, camera_model,
+                width, height) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             batch_data,
         )
 
-        # Process ML groups
-        detection_mode = "integrated" if mode == "integrated" else "ml"
-        ml_batch_data = []
-
-        for group_id, group_members in enumerate(ml_groups, 1):
-            best_rep = group_members[0]
-            member_scores = {}
-
-            for member in group_members:
-                scores = [
-                    result.get("integrated_score", result["sscd_similarity"])
-                    for result in finder.detailed_results
-                    if result["orig_idx1"] == member or result["orig_idx2"] == member
-                ]
-                if scores:
-                    member_scores[member] = np.mean(scores)
-
-            if member_scores:
-                best_rep = max(member_scores, key=lambda k: member_scores[k])
-
-            for member in group_members:
-                member_details = None
-                for result in finder.detailed_results:
-                    if (result["orig_idx1"] == member or result["orig_idx2"] == member) and (
-                        member_details is None
-                        or result.get("integrated_score", result["sscd_similarity"])
-                        > member_details.get("integrated_score", member_details["sscd_similarity"])
-                    ):
-                        member_details = result
-
-                if mode == "integrated" and member_details:
-                    if member_details.get("has_metadata_bonus", False):
-                        detection_method = "ml+metadata"
-                    else:
-                        detection_method = "ml"
-                else:
-                    detection_method = "ml"
-
-                metadata = finder.all_metadata.get(member, {})
-                width = metadata.get("width", 0)
-                height = metadata.get("height", 0)
-                resolution = f"{width}x{height}" if width and height else "unknown"
-
-                ml_batch_data.append(
-                    (
-                        str(image_paths[member].absolute()),
-                        image_paths[member].name,
-                        f"{detection_mode.upper()}_{group_id}",
-                        member == best_rep,
-                        detection_method,
-                        member_details["sscd_similarity"] if member_details else 0,
-                        member_details.get("geometric_inliers", 0) if member_details else 0,
-                        member_details.get("has_metadata_bonus", False)
-                        if member_details
-                        else False,
-                        resolution,
-                        "active",
-                        metadata.get("datetime_original"),
-                        metadata.get("camera_make"),
-                        metadata.get("camera_model"),
-                        width,
-                        height,
-                    )
-                )
-
-        # Batch insert ML groups
+        ml_batch_data = _prepare_ml_batch(ml_groups, image_paths, finder, mode)
         if ml_batch_data:
             cursor.executemany(
-                """
-                INSERT INTO images (path, name, group_id, is_representative,
-                                  detection_method, sscd_score, geometric_inliers,
-                                  metadata_bonus, resolution, status,
-                                  datetime_original, camera_make, camera_model,
-                                  width, height)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+                """INSERT INTO images (path, name, group_id, is_representative,
+                    detection_method, sscd_score, geometric_inliers, metadata_bonus,
+                    resolution, status, datetime_original, camera_make, camera_model,
+                    width, height) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 ml_batch_data,
             )
 
-        conn.commit()  # Final commit
+        conn.commit()
 
 
-def load_active_groups(check_files=False):
-    """Load active groups from database"""
-    assert app_state.db_path is not None, "db_path must be set before loading groups"
+def load_active_groups(*, check_files: bool = False) -> list[str]:
+    """Load active groups from database.
+
+    Args:
+        check_files: Whether to check file existence.
+
+    Returns:
+        List of active group IDs.
+
+    """
+    if app_state.db_path is None:
+        msg = "db_path must be set before loading groups"
+        raise ValueError(msg)
     with get_db_connection(app_state.db_path) as conn:
         cursor = conn.cursor()
 
@@ -1603,10 +2105,10 @@ def load_active_groups(check_files=False):
             rows = cursor.fetchall()
 
             # Batch check file existence
-            missing_ids = []
+            missing_ids: list[int] = []
             with ThreadPoolExecutor(max_workers=10) as executor:
 
-                def check_file(row):
+                def check_file(row: Any) -> tuple[int, bool]:  # noqa: ANN401
                     return (row["id"], Path(row["path"]).exists())
 
                 results = executor.map(check_file, rows)
@@ -1647,8 +2149,19 @@ def load_active_groups(check_files=False):
 # ==============================================================================
 
 
-def create_thumbnail(image_path, max_size=(800, 800)):
-    """Create base64 encoded thumbnail with caching"""
+def create_thumbnail(
+    image_path: Path, max_size: tuple[int, int] = (800, 800)
+) -> str | None:
+    """Create base64 encoded thumbnail with caching.
+
+    Args:
+        image_path: Path to the image file.
+        max_size: Maximum thumbnail dimensions.
+
+    Returns:
+        Base64 encoded thumbnail string or None on error.
+
+    """
     # Check cache first
     path_str = str(image_path)
     cached = app_state.thumbnail_cache.get(path_str)
@@ -1670,36 +2183,60 @@ def create_thumbnail(image_path, max_size=(800, 800)):
 
         # Cache the result
         app_state.thumbnail_cache.put(path_str, thumbnail)
-        return thumbnail
     except (OSError, Image.DecompressionBombError) as e:
         print(f"Error loading image {image_path}: {e}")
         return None
+    else:
+        return thumbnail
 
 
-def get_current_position():
-    """Get the current position in the navigation list"""
+def get_current_position() -> int:
+    """Get the current position in the navigation list.
+
+    Returns:
+        Index of current group in the active groups list.
+
+    """
     if app_state.current_group_id in app_state.initial_active_groups:
         return app_state.initial_active_groups.index(app_state.current_group_id)
     return 0
 
 
-def is_group_still_active(group_id):
-    """Check if a group still has enough active images"""
+def is_group_still_active(group_id: str) -> bool:
+    """Check if a group still has enough active images.
+
+    Args:
+        group_id: The group ID to check.
+
+    Returns:
+        True if group is still active.
+
+    """
     return group_id in app_state.active_groups_set
 
 
-def clear_caches():
-    """Clear all caches"""
+def clear_caches() -> None:
+    """Clear all caches."""
     app_state.thumbnail_cache.clear()
     app_state.group_data_cache.clear()
 
 
-def cache_route(timeout=5):
-    def decorator(f):
-        cache = {}
+def cache_route(timeout: int = 5) -> Any:  # noqa: ANN401 - decorator type
+    """Create a caching decorator for routes.
+
+    Args:
+        timeout: Cache timeout in seconds.
+
+    Returns:
+        Decorator function.
+
+    """
+
+    def decorator(f: Any) -> Any:  # noqa: ANN401 - callable type
+        cache: dict[tuple[Any, ...], tuple[Any, float]] = {}
 
         @wraps(f)
-        def decorated_function(*args, **kwargs):
+        def decorated_function(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
             cache_key = (args, frozenset(kwargs.items()))
 
             # Check cache
@@ -1713,7 +2250,7 @@ def cache_route(timeout=5):
             cache[cache_key] = (result, time.time())
 
             # Clean old entries
-            if len(cache) > 100:
+            if len(cache) > MAX_ROUTE_CACHE_ENTRIES:
                 oldest = min(cache.items(), key=lambda x: x[1][1])
                 del cache[oldest[0]]
 
@@ -1724,77 +2261,49 @@ def cache_route(timeout=5):
     return decorator
 
 
-@app.route("/")
-def index():
-    """Show current group"""
-    if not app_state.db_path or not Path(app_state.db_path).exists():
-        return "No database found"
+def _render_all_done() -> Any:  # noqa: ANN401 - Flask Response type
+    """Render the all-done template.
 
-    # Only load active groups if not already loaded
-    if not app_state.initial_active_groups:
-        load_active_groups(check_files=True)  # Check files on initial load
+    Returns:
+        Rendered template for completed state.
 
-    # Check if all groups are done
-    if not app_state.active_groups_set:
-        assert app_state.db_path is not None
-        with get_db_connection(app_state.db_path) as conn:
-            cursor = conn.cursor()
+    """
+    if app_state.db_path is None:
+        return "Database not initialized"
+    with get_db_connection(app_state.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM images WHERE status = 'deleted'")
+        total_deleted = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM images WHERE status = 'active'")
+        total_remaining = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(DISTINCT group_id) FROM images")
+        total_groups = cursor.fetchone()[0]
 
-            cursor.execute("SELECT COUNT(*) FROM images WHERE status = 'deleted'")
-            total_deleted = cursor.fetchone()[0]
+    return render_template(
+        "duplicate-detector-ui.html",
+        all_done=True,
+        total_groups=total_groups,
+        total_deleted=total_deleted,
+        total_remaining=total_remaining,
+    )
 
-            cursor.execute("SELECT COUNT(*) FROM images WHERE status = 'active'")
-            total_remaining = cursor.fetchone()[0]
 
-            cursor.execute("SELECT COUNT(DISTINCT group_id) FROM images")
-            total_groups = cursor.fetchone()[0]
+def _prepare_image_list(group_data: list[Any]) -> tuple[list[dict[str, Any]], int, str]:
+    """Prepare image data list from group data.
 
-        return render_template(
-            "duplicate-detector-ui.html",
-            all_done=True,
-            total_groups=total_groups,
-            total_deleted=total_deleted,
-            total_remaining=total_remaining,
-        )
+    Args:
+        group_data: Raw database rows for the group.
 
-    # Ensure current group is valid
-    if app_state.current_group_id not in app_state.active_groups_set:
-        # Find first active group
-        for group_id in app_state.initial_active_groups:
-            if group_id in app_state.active_groups_set:
-                app_state.current_group_id = group_id
-                break
+    Returns:
+        Tuple of (images list, active count, detection method).
 
-    # Get current group data
-    # Get current group data and total groups in one connection
-    current_group_data = app_state.group_data_cache.get(app_state.current_group_id)
-    total_groups = app_state.total_groups_cache
-
-    if current_group_data is None or total_groups is None:
-        assert app_state.db_path is not None
-        with get_db_connection(app_state.db_path) as conn:
-            cursor = conn.cursor()
-            if current_group_data is None:
-                cursor.execute(
-                    "SELECT * FROM images WHERE group_id = ? ORDER BY is_representative DESC, id LIMIT 100",
-                    (app_state.current_group_id,),
-                )
-                current_group_data = cursor.fetchall()
-                app_state.group_data_cache.put(app_state.current_group_id, current_group_data)
-
-            if total_groups is None:
-                cursor.execute("SELECT COUNT(DISTINCT group_id) FROM images")
-                total_groups = cursor.fetchone()[0]
-                app_state.total_groups_cache = total_groups
-
-    # Prepare image data
-    images = []
+    """
+    images: list[dict[str, Any]] = []
     active_count = 0
     detection_method = "unknown"
 
-    for row in current_group_data:
+    for row in group_data:
         image_path = Path(row["path"])
-
         image_info = {
             "id": row["id"],
             "name": row["name"],
@@ -1806,34 +2315,90 @@ def index():
             "status": row["status"],
             "resolution": row["resolution"],
             "datetime_original": row["datetime_original"],
-            "file_size": 0,  # Will calculate if file exists
+            "file_size": 0,
         }
-
         if image_info["exists"]:
             with contextlib.suppress(builtins.BaseException):
                 image_info["file_size"] = image_path.stat().st_size
-
             if image_info["status"] == "active":
                 active_count += 1
-
         if detection_method == "unknown":
             detection_method = row["detection_method"]
-
         images.append(image_info)
 
-    # Calculate progress
+    return images, active_count, detection_method
+
+
+def _ensure_valid_current_group() -> None:
+    """Ensure current_group_id is valid and in active set."""
+    if app_state.current_group_id not in app_state.active_groups_set:
+        for group_id in app_state.initial_active_groups:
+            if group_id in app_state.active_groups_set:
+                app_state.current_group_id = group_id
+                break
+
+
+def _load_group_data_if_needed() -> tuple[Any, int]:
+    """Load current group data and total groups from cache or database.
+
+    Returns:
+        Tuple of (group data rows, total groups count).
+
+    """
+    group_id = app_state.current_group_id
+    if group_id is None:
+        return [], 0
+
+    current_group_data = app_state.group_data_cache.get(group_id)
+    total_groups = app_state.total_groups_cache
+
+    if current_group_data is None or total_groups is None:
+        if app_state.db_path is None:
+            return [], 0
+        with get_db_connection(app_state.db_path) as conn:
+            cursor = conn.cursor()
+            if current_group_data is None:
+                cursor.execute(
+                    "SELECT * FROM images WHERE group_id = ? ORDER BY is_representative DESC, id LIMIT 100",
+                    (group_id,),
+                )
+                current_group_data = cursor.fetchall()
+                app_state.group_data_cache.put(group_id, current_group_data)
+            if total_groups is None:
+                cursor.execute("SELECT COUNT(DISTINCT group_id) FROM images")
+                total_groups = cursor.fetchone()[0]
+                app_state.total_groups_cache = total_groups
+
+    return current_group_data, total_groups or 0
+
+
+@app.route("/")
+def index() -> Any:  # noqa: ANN401 - Flask Response typing
+    """Show current group."""
+    if not app_state.db_path or not Path(app_state.db_path).exists():
+        return "No database found"
+
+    if not app_state.initial_active_groups:
+        load_active_groups(check_files=True)
+
+    if not app_state.active_groups_set:
+        return _render_all_done()
+
+    _ensure_valid_current_group()
+    current_group_data, total_groups = _load_group_data_if_needed()
+
+    if not current_group_data:
+        return _render_all_done()
+
+    images, active_count, detection_method = _prepare_image_list(current_group_data)
     current_pos = get_current_position()
     completed_groups = len(app_state.initial_active_groups) - len(app_state.active_groups_set)
-
     progress_percent = int((completed_groups / total_groups) * 100) if total_groups else 0
 
-    # Check navigation boundaries
-    is_first = current_pos == 0
-    has_next_active = False
-    for i in range(current_pos + 1, len(app_state.initial_active_groups)):
-        if app_state.initial_active_groups[i] in app_state.active_groups_set:
-            has_next_active = True
-            break
+    has_next_active = any(
+        app_state.initial_active_groups[i] in app_state.active_groups_set
+        for i in range(current_pos + 1, len(app_state.initial_active_groups))
+    )
 
     return render_template(
         "duplicate-detector-ui.html",
@@ -1847,139 +2412,143 @@ def index():
         detection_method=detection_method,
         active_images_count=active_count,
         images=images,
-        is_first_group=is_first,
-        is_last_group=current_pos >= len(app_state.initial_active_groups) - 1
-        and not has_next_active,
+        is_first_group=current_pos == 0,
+        is_last_group=current_pos >= len(app_state.initial_active_groups) - 1 and not has_next_active,
     )
 
 
+def _move_to_trash(image_path: Path) -> bool:
+    """Move file to trash or delete it.
+
+    Args:
+        image_path: Path to the file to delete.
+
+    Returns:
+        True if successful.
+
+    """
+    trash_dir = Path.home() / ".Trash"
+    if trash_dir.exists():
+        timestamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
+        trash_name = f"{timestamp}_{image_path.name}"
+        shutil.move(str(image_path), str(trash_dir / trash_name))
+    else:
+        image_path.unlink()
+    return True
+
+
+def _process_file_deletions(
+    files_to_trash: list[tuple[Path, Any]], group_id: str | None
+) -> tuple[int, list[str], list[Any]]:
+    """Process file deletions.
+
+    Args:
+        files_to_trash: List of (path, row) tuples.
+        group_id: Current group ID.
+
+    Returns:
+        Tuple of (deleted count, results list, successfully deleted rows).
+
+    """
+    deleted_count = 0
+    deletion_results: list[str] = []
+    successfully_deleted: list[Any] = []
+
+    for image_path, row in files_to_trash:
+        if not image_path.exists():
+            deletion_results.append(f"✗ Not found: {row['name']}")
+            continue
+
+        try:
+            _move_to_trash(image_path)
+            deleted_count += 1
+            deletion_results.append(f"✓ Deleted: {row['name']}")
+            successfully_deleted.append(row)
+
+            with Path("deleted_files_log.txt").open("a") as f:
+                f.write(f"{datetime.now(tz=UTC)}: Deleted {image_path} (Group: {group_id})\n")
+
+        except (OSError, shutil.Error) as e:
+            deletion_results.append(f"✗ Failed: {row['name']} - {e!s}")
+
+    return deleted_count, deletion_results, successfully_deleted
+
+
 @app.route("/delete", methods=["POST"])
-def delete_images():
-    """Delete selected images and update database"""
+def delete_images() -> Any:  # noqa: ANN401 - Flask Response typing
+    """Delete selected images and update database."""
     data = request.get_json()
     indices = data.get("indices", [])
 
     if app_state.current_group_id is None:
         return jsonify({"success": False, "error": "No active group"})
 
-    assert app_state.db_path is not None
+    if app_state.db_path is None:
+        return jsonify({"success": False, "error": "Database not initialized"})
     with get_db_connection(app_state.db_path) as conn:
         cursor = conn.cursor()
-
         cursor.execute(
             "SELECT * FROM images WHERE group_id = ? ORDER BY is_representative DESC, id LIMIT 100",
             (app_state.current_group_id,),
         )
         current_group_data = list(cursor.fetchall())
 
-        deleted_count = 0
-        deletion_results = []
-        group_complete = False
-
-        # Collect all updates first
-        ids_to_delete = []
-        files_to_trash = []
-
+        ids_to_delete: list[int] = []
+        files_to_trash: list[tuple[Path, Any]] = []
         for idx in indices:
             if idx < len(current_group_data):
                 row = current_group_data[idx]
                 ids_to_delete.append(row["id"])
                 files_to_trash.append((Path(row["path"]), row))
 
-        # Batch update database status first (fast operation)
         if ids_to_delete:
             placeholders = ",".join("?" * len(ids_to_delete))
             cursor.execute(
-                f"UPDATE images SET status = 'deleted' WHERE id IN ({placeholders})", ids_to_delete
-            )
-            conn.commit()  # Commit database changes immediately
-
-    # Process file deletions outside of database transaction
-    successfully_deleted = []
-    for image_path, row in files_to_trash:
-        if image_path.exists():
-            try:
-                # Move to trash
-                trash_dir = Path.home() / ".Trash"
-                if trash_dir.exists():
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    trash_name = f"{timestamp}_{image_path.name}"
-                    shutil.move(str(image_path), str(trash_dir / trash_name))
-                else:
-                    image_path.unlink()
-
-                deleted_count += 1
-                deletion_results.append(f"✓ Deleted: {row['name']}")
-                successfully_deleted.append(row)
-
-                # Also log to text file for compatibility
-                with Path("deleted_files_log.txt").open("a") as f:
-                    f.write(
-                        f"{datetime.now()}: Deleted {image_path} (Group: {app_state.current_group_id})\n"
-                    )
-
-            except Exception as e:
-                deletion_results.append(f"✗ Failed: {row['name']} - {e!s}")
-        else:
-            deletion_results.append(f"✗ Not found: {row['name']}")
-
-    # Log successful deletions in separate transaction
-    if successfully_deleted:
-        assert app_state.db_path is not None
-        with get_db_connection(app_state.db_path) as conn:
-            cursor = conn.cursor()
-            deletion_log_data = [
-                (row["path"], app_state.current_group_id) for row in successfully_deleted
-            ]
-            cursor.executemany(
-                """
-                INSERT INTO deletion_log (image_path, group_id)
-                VALUES (?, ?)
-            """,
-                deletion_log_data,
+                f"UPDATE images SET status = 'deleted' WHERE id IN ({placeholders})",  # noqa: S608
+                ids_to_delete,
             )
             conn.commit()
 
-        # Thread-safe state modifications
-        with app_state._lock:
-            # Invalidate caches for this group and the total-groups count
+    deleted_count, deletion_results, successfully_deleted = _process_file_deletions(
+        files_to_trash, app_state.current_group_id
+    )
+
+    group_complete = False
+    if successfully_deleted:
+        with get_db_connection(app_state.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.executemany(
+                "INSERT INTO deletion_log (image_path, group_id) VALUES (?, ?)",
+                [(row["path"], app_state.current_group_id) for row in successfully_deleted],
+            )
+            conn.commit()
+
+        with app_state.locked():
             app_state.group_data_cache.remove(app_state.current_group_id)
             app_state.total_groups_cache = None
-
-            # Check if group is still active
             cursor.execute(
-                """
-                SELECT COUNT(*) as active_count
-                FROM images
-                WHERE group_id = ? AND status = 'active'
-            """,
+                "SELECT COUNT(*) as active_count FROM images WHERE group_id = ? AND status = 'active'",
                 (app_state.current_group_id,),
             )
-
             active_count = cursor.fetchone()["active_count"]
-            group_complete = active_count < 2
-
+            group_complete = active_count < MIN_GROUP_SIZE
             if group_complete:
-                # Remove from active groups set
                 app_state.active_groups_set.discard(app_state.current_group_id)
-                # Clear cache for this group (avoid double removal)
                 app_state.group_data_cache.remove(app_state.current_group_id)
 
-    return jsonify(
-        {
-            "success": True,
-            "deleted_count": deleted_count,
-            "requested_count": len(indices),
-            "group_complete": group_complete,
-            "deletion_results": deletion_results,
-        }
-    )
+    return jsonify({
+        "success": True,
+        "deleted_count": deleted_count,
+        "requested_count": len(indices),
+        "group_complete": group_complete,
+        "deletion_results": deletion_results,
+    })
 
 
 @app.route("/next")
-def next_group():
-    """Go to next active group"""
-    with app_state._lock:
+def next_group() -> Any:  # noqa: ANN401 - Flask Response typing
+    """Go to next active group."""
+    with app_state.locked():
         current_pos = get_current_position()
         found_next = False
 
@@ -2003,9 +2572,9 @@ def next_group():
 
 
 @app.route("/previous")
-def previous_group():
-    """Go to previous active group"""
-    with app_state._lock:
+def previous_group() -> Any:  # noqa: ANN401 - Flask Response typing
+    """Go to previous active group."""
+    with app_state.locked():
         current_pos = get_current_position()
 
         # Look for previous active group
@@ -2019,10 +2588,19 @@ def previous_group():
 
 
 @app.route("/image/<int:image_id>")
-def serve_image(image_id):
-    """Securely serves an image using its database ID"""
+def serve_image(image_id: int) -> Any:  # noqa: ANN401 - Flask Response typing
+    """Securely serve an image using its database ID.
+
+    Args:
+        image_id: Database ID of the image.
+
+    Returns:
+        Image response or error tuple.
+
+    """
     try:
-        assert app_state.db_path is not None
+        if app_state.db_path is None:
+            return "Database not initialized", 500
         with get_db_connection(app_state.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT path FROM images WHERE id = ?", (image_id,))
@@ -2044,7 +2622,7 @@ def serve_image(image_id):
             image_bytes = base64.b64decode(thumb_data)
 
             # Create response with proper headers
-            response = Response(
+            return Response(
                 image_bytes,
                 mimetype="image/jpeg",
                 headers={
@@ -2053,9 +2631,7 @@ def serve_image(image_id):
                 },
             )
 
-            return response
-
-    except Exception as e:
+    except (OSError, sqlite3.Error, ValueError) as e:
         return f"Error serving image: {e!s}", 500
 
 
@@ -2063,57 +2639,42 @@ def serve_image(image_id):
 # Main Pipeline
 # ==============================================================================
 
+# Detection mode descriptions
+MODE_DESCRIPTIONS = {
+    "metadata": "Metadata only (EXIF DateTime + Camera)",
+    "ml": "ML only (Neural + Geometric)",
+    "both": "Sequential (Metadata → ML on remainder)",
+    "integrated": "Integrated (ML with metadata bonus)",
+}
 
-def run_detection(config: Config, pm: ProgressManager):
-    """
-    Run the duplicate detection pipeline
 
-    Processes all images in the specified folder to detect duplicates
-    using the configured detection method (metadata, ML, or integrated).
+def _scan_image_files(config: Config, pm: ProgressManager) -> list[Path]:
+    """Scan folder for image files.
 
     Args:
-        config: Detection configuration
-        pm: Progress manager for logging
+        config: Detection configuration.
+        pm: Progress manager for logging.
+
+    Returns:
+        Sorted list of absolute image paths.
+
     """
-    start_time = time.time()
-
-    mode_descriptions = {
-        "metadata": "Metadata only (EXIF DateTime + Camera)",
-        "ml": "ML only (Neural + Geometric)",
-        "both": "Sequential (Metadata → ML on remainder)",
-        "integrated": "Integrated (ML with metadata bonus)",
-    }
-
-    pm.log(f"\nMode: {config.mode} - {mode_descriptions[config.mode]}")
-
-    # Note: duplicate-detector-ui.html template should be in same directory as this script
-
-    # Simpler approach: Always scan all images, but optimize feature extraction
     pm.log("\n[bold]Scanning for images...[/bold]")
-    image_paths = []
+    image_paths: list[Path] = []
     for ext in config.image_extensions:
-        image_paths.extend(list(config.image_folder.glob(f"*{ext}")))
-    # Ensure absolute paths and unique
-    image_paths = sorted({path.absolute() for path in image_paths})
+        image_paths.extend(config.image_folder.glob(f"*{ext}"))
+    return sorted({path.absolute() for path in image_paths})
 
-    # Check if we have existing results
-    has_existing_data = False
-    if config.db_path.exists():
-        with get_db_connection(config.db_path) as conn:
-            cursor = conn.cursor()
-            folder_path = str(config.image_folder.absolute())
-            cursor.execute("SELECT COUNT(*) FROM images WHERE path LIKE ?", (f"{folder_path}%",))
-            count = cursor.fetchone()[0]
-            has_existing_data = count > 0
 
-    if has_existing_data and len(image_paths) == 0:
-        pm.log("\n[yellow]No images found in folder.[/yellow]")
-        return False
+def _log_image_types(image_paths: list[Path], pm: ProgressManager) -> None:
+    """Log image type statistics.
 
-    pm.log(f"[green]✓ Found {len(image_paths)} images[/green]")
+    Args:
+        image_paths: List of image paths.
+        pm: Progress manager for logging.
 
-    # Count by type
-    type_counts = defaultdict(int)
+    """
+    type_counts: dict[str, int] = defaultdict(int)
     for path in image_paths:
         type_counts[path.suffix.lower()] += 1
 
@@ -2121,101 +2682,71 @@ def run_detection(config: Config, pm: ProgressManager):
     for ext, count in sorted(type_counts.items()):
         pm.log(f"  {ext}: {count}")
 
-    if not image_paths:
-        pm.log("[red]No images found![/red]")
-        return False
 
-    # Initialize database
-    init_database(config.db_path)
+def _extract_features_with_cache(
+    config: Config, pm: ProgressManager, image_paths: list[Path]
+) -> np.ndarray:
+    """Extract features with caching support.
 
-    # Initialize finder
-    finder = DuplicateFinder(config, pm)
-    finder.extract_all_metadata(image_paths)
+    Args:
+        config: Detection configuration.
+        pm: Progress manager for logging.
+        image_paths: List of image paths.
 
-    metadata_groups = []
-    ml_groups = []
-    exclude_indices = set()
-    model_manager = None
-    features = None
-    detection_mode = ""
+    Returns:
+        Feature array for all images.
 
-    # Metadata detection
-    if config.mode in ["metadata", "both"]:
-        pm.log("\n[bold cyan]Phase 1: Metadata Detection[/bold cyan]")
-        metadata_groups, exclude_indices = finder.find_metadata_duplicates(image_paths)
+    """
+    cache_key = config.get_cache_key()
+    feature_cache_file = config.cache_dir / f"features_enhanced_{cache_key}.npz"
 
-    # ML detection
-    if config.mode in ["ml", "both", "integrated"]:
-        if config.mode == "integrated":
-            pm.log("\n[bold cyan]Integrated Detection (ML + Metadata Bonus)[/bold cyan]")
-        else:
-            pm.log("\n[bold cyan]Phase 2: ML Detection (Neural + Geometric)[/bold cyan]")
+    if feature_cache_file.exists():
+        pm.log("Loading cached features...")
+        cache = np.load(feature_cache_file, mmap_mode="r")
+        features = np.array(cache["sscd"])
+        pm.log("[green]✓ Loaded features from cache[/green]")
+        return features
 
-        # Extract features with smart caching
-        cache_key = config.get_cache_key()
-        feature_cache_file = config.cache_dir / f"features_enhanced_{cache_key}.npz"
+    model_manager = FastModelManager(config, pm)
+    model_manager.load_models()
+    features = model_manager.extract_features_fast(image_paths)
 
-        # Always extract features for all images (simpler approach)
-        if feature_cache_file.exists():
-            # Cache exists - use cached features
-            pm.log("Loading cached features...")
-            cache = np.load(feature_cache_file, mmap_mode="r")
-            features = np.array(cache["sscd"])
-            pm.log("[green]✓ Loaded features from cache[/green]")
-        else:
-            # Extract features for all images
-            model_manager = FastModelManager(config, pm)
-            model_manager.load_models()
-            features = model_manager.extract_features_fast(image_paths)
+    pm.log("Saving feature cache...")
+    np.savez_compressed(feature_cache_file, sscd=features)
+    model_manager.cleanup()
 
-            # Save updated cache
-            pm.log("Saving feature cache...")
-            np.savez_compressed(feature_cache_file, sscd=features)
+    return features
 
-            if model_manager:
-                model_manager.cleanup()
 
-        # Find ML duplicates
-        if config.mode == "both":
-            pm.log(
-                f"[yellow]Excluding {len(exclude_indices)} images already found by metadata[/yellow]"
-            )
+def _display_detection_summary(  # noqa: PLR0913 - display function with related params
+    config: Config,
+    image_paths: list[Path],
+    metadata_groups: list[list[int]],
+    ml_groups: list[list[int]],
+    exclude_indices: set[int],
+    detection_mode: str,
+    finder: DuplicateFinder,
+    elapsed: float,
+) -> None:
+    """Display the detection summary table.
 
-        detection_mode = "integrated" if config.mode == "integrated" else "ml"
+    Args:
+        config: Detection configuration.
+        image_paths: List of all image paths.
+        metadata_groups: Metadata duplicate groups.
+        ml_groups: ML duplicate groups.
+        exclude_indices: Indices excluded by metadata detection.
+        detection_mode: The detection mode used.
+        finder: DuplicateFinder instance.
+        elapsed: Total processing time.
 
-        ml_groups = finder.find_ml_duplicates(
-            features,
-            image_paths,
-            exclude_indices if config.mode == "both" else set(),
-            mode=detection_mode,
-        )
-
-        if model_manager:
-            model_manager.cleanup()
-
-    # Save results to database
-    pm.log("\n[bold]Saving results to database...[/bold]")
-    save_results_to_db(
-        config,
-        image_paths,
-        finder,
-        metadata_groups,
-        ml_groups,
-        exclude_indices,
-        config.mode,
-        features,
-    )
-    pm.log("[green]✓ Results saved to database[/green]")
-
-    # Summary
-    elapsed = time.time() - start_time
-
+    """
     summary_table = Table(title="Detection Summary", show_header=True)
     summary_table.add_column("Metric", style="cyan")
     summary_table.add_column("Value", style="green")
 
     summary_table.add_row("Total images", str(len(image_paths)))
-    summary_table.add_row("Detection mode", f"{config.mode} - {mode_descriptions[config.mode]}")
+    summary_table.add_row("Detection mode", f"{config.mode} - {MODE_DESCRIPTIONS[config.mode]}")
 
     if config.mode in ["metadata", "both"]:
         summary_table.add_row("Metadata duplicate groups", str(len(metadata_groups)))
@@ -2228,16 +2759,7 @@ def run_detection(config: Config, pm: ProgressManager):
         )
 
         if config.mode == "integrated":
-            # Count groups with metadata bonus
-            groups_with_metadata = set()
-            for group in ml_groups:
-                for member in group:
-                    for result in finder.detailed_results:
-                        if (
-                            result["orig_idx1"] == member or result["orig_idx2"] == member
-                        ) and result.get("has_metadata_bonus", False):
-                            groups_with_metadata.add(tuple(group))
-                            break
+            groups_with_metadata = _count_groups_with_metadata_bonus(ml_groups, finder)
             summary_table.add_row("Groups with metadata bonus", str(len(groups_with_metadata)))
 
     total_dups = len(exclude_indices) + sum(len(g) for g in ml_groups)
@@ -2250,43 +2772,139 @@ def run_detection(config: Config, pm: ProgressManager):
     console.print("\n")
     console.print(summary_table)
 
+
+def _count_groups_with_metadata_bonus(
+    ml_groups: list[list[int]], finder: DuplicateFinder
+) -> set[tuple[int, ...]]:
+    """Count groups that have metadata bonus applied.
+
+    Args:
+        ml_groups: ML duplicate groups.
+        finder: DuplicateFinder instance.
+
+    Returns:
+        Set of group tuples with metadata bonus.
+
+    """
+    groups_with_metadata: set[tuple[int, ...]] = set()
+    for group in ml_groups:
+        for member in group:
+            for result in finder.detailed_results:
+                if (
+                    result["orig_idx1"] == member or result["orig_idx2"] == member
+                ) and result.get("has_metadata_bonus", False):
+                    groups_with_metadata.add(tuple(group))
+                    break
+    return groups_with_metadata
+
+
+def run_detection(config: Config, pm: ProgressManager) -> bool:
+    """Run the duplicate detection pipeline.
+
+    Args:
+        config: Detection configuration.
+        pm: Progress manager for logging.
+
+    Returns:
+        True if detection completed successfully.
+
+    """
+    start_time = time.time()
+    pm.log(f"\nMode: {config.mode} - {MODE_DESCRIPTIONS[config.mode]}")
+
+    image_paths = _scan_image_files(config, pm)
+
+    if not image_paths:
+        pm.log("[red]No images found![/red]")
+        return False
+
+    pm.log(f"[green]✓ Found {len(image_paths)} images[/green]")
+    _log_image_types(image_paths, pm)
+
+    init_database(config.db_path)
+    finder = DuplicateFinder(config, pm)
+    finder.extract_all_metadata(image_paths)
+
+    metadata_groups: list[list[int]] = []
+    ml_groups: list[list[int]] = []
+    exclude_indices: set[int] = set()
+    features: np.ndarray | None = None
+    detection_mode = ""
+
+    if config.mode in ["metadata", "both"]:
+        pm.log("\n[bold cyan]Phase 1: Metadata Detection[/bold cyan]")
+        metadata_groups, exclude_indices = finder.find_metadata_duplicates(image_paths)
+
+    if config.mode in ["ml", "both", "integrated"]:
+        if config.mode == "integrated":
+            pm.log("\n[bold cyan]Integrated Detection (ML + Metadata Bonus)[/bold cyan]")
+        else:
+            pm.log("\n[bold cyan]Phase 2: ML Detection (Neural + Geometric)[/bold cyan]")
+
+        features = _extract_features_with_cache(config, pm, image_paths)
+
+        if config.mode == "both":
+            pm.log(f"[yellow]Excluding {len(exclude_indices)} images already found by metadata[/yellow]")
+
+        detection_mode = "integrated" if config.mode == "integrated" else "ml"
+        ml_groups = finder.find_ml_duplicates(
+            features,
+            image_paths,
+            exclude_indices if config.mode == "both" else set(),
+            mode=detection_mode,
+        )
+
+    pm.log("\n[bold]Saving results to database...[/bold]")
+    save_results_to_db(
+        config, image_paths, finder, metadata_groups, ml_groups,
+        exclude_indices, config.mode, features,
+    )
+    pm.log("[green]✓ Results saved to database[/green]")
+
+    elapsed = time.time() - start_time
+    _display_detection_summary(
+        config, image_paths, metadata_groups, ml_groups,
+        exclude_indices, detection_mode, finder, elapsed,
+    )
+
     return True
 
 
-def main():
-    """Main entry point"""
+def _parse_arguments() -> Any:  # noqa: ANN401 - argparse Namespace
+    """Parse command line arguments.
+
+    Returns:
+        Parsed arguments namespace.
+
+    """
     import argparse
 
     parser = argparse.ArgumentParser(description="Unified Duplicate Detector - Detection + Review")
     parser.add_argument("image_folder", help="Folder containing images")
     parser.add_argument(
-        "--mode",
-        "-m",
-        choices=["metadata", "ml", "both", "integrated"],
-        default="integrated",
-        help="Detection mode (default: integrated)",
+        "--mode", "-m", choices=["metadata", "ml", "both", "integrated"],
+        default="integrated", help="Detection mode (default: integrated)",
     )
     parser.add_argument("--threshold", "-t", type=float, help="SSCD threshold")
     parser.add_argument("--batch-size", "-b", type=int, default=64, help="Batch size")
     parser.add_argument("--workers", "-w", type=int, default=11, help="Number of workers")
-    parser.add_argument(
-        "--dataloader-workers", "-dw", type=int, default=8, help="DataLoader workers"
-    )
+    parser.add_argument("--dataloader-workers", "-dw", type=int, default=8, help="DataLoader workers")
     parser.add_argument("--no-cache", action="store_true", help="Don't use cache")
     parser.add_argument("--port", "-p", type=int, default=5555, help="Web UI port")
     parser.add_argument("--no-browser", action="store_true", help="Don't auto-open browser")
+    return parser.parse_args()
 
-    args = parser.parse_args()
 
-    console.print(
-        Panel.fit(
-            "[bold cyan]Unified Duplicate Detector[/bold cyan]\n"
-            "Detection + Review in one tool\n"
-            "Supports: HEIC/JPEG | Methods: Metadata + ML",
-            border_style="cyan",
-        )
-    )
+def _configure_from_args(args: Any) -> Config:  # noqa: ANN401 - argparse Namespace
+    """Create Config from parsed arguments.
 
+    Args:
+        args: Parsed arguments namespace.
+
+    Returns:
+        Configured Config instance.
+
+    """
     config = Config()
     config.image_folder = Path(args.image_folder).absolute()
     config.mode = args.mode
@@ -2298,16 +2916,57 @@ def main():
         config.sscd_threshold = args.threshold
 
     if args.no_cache and config.cache_dir.exists():
-        # Only delete feature cache files, not the entire directory
         for cache_file in config.cache_dir.glob("features_*.npz"):
             cache_file.unlink()
         console.print("[yellow]Cleared feature cache[/yellow]")
 
-    # Run detection
+    return config
+
+
+def _start_web_server(port: int, *, auto_open: bool) -> None:
+    """Start the web UI server.
+
+    Args:
+        port: Port number for the server.
+        auto_open: Whether to auto-open browser.
+
+    """
+    console.print("\n[bold cyan]Launching review interface...[/bold cyan]")
+    console.print(f"Starting server on http://localhost:{port}")
+    console.print("Press Ctrl+C to stop\n")
+
+    if auto_open:
+        def open_browser() -> None:
+            time.sleep(1.5)
+            webbrowser.open(f"http://localhost:{port}")
+
+        threading.Thread(target=open_browser, daemon=True).start()
+
+    try:
+        serve(app, host="0.0.0.0", port=port, threads=4)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Server stopped[/yellow]")
+        sys.exit(0)
+
+
+def main() -> None:
+    """Execute the main entry point."""
+    args = _parse_arguments()
+
+    console.print(
+        Panel.fit(
+            "[bold cyan]Unified Duplicate Detector[/bold cyan]\n"
+            "Detection + Review in one tool\n"
+            "Supports: HEIC/JPEG | Methods: Metadata + ML",
+            border_style="cyan",
+        )
+    )
+
+    config = _configure_from_args(args)
+
     try:
         with ProgressManager() as pm:
             start_time = time.time()
-
             pm.log("\n[bold]System Information:[/bold]")
             pm.log(f"Device: {config.device.upper()}")
             pm.log(f"CPU cores: {mp.cpu_count()}")
@@ -2316,50 +2975,21 @@ def main():
             pm.log(f"Memory: {humanize.naturalsize(psutil.virtual_memory().total)}")
 
             success = run_detection(config, pm)
-
             if success:
                 elapsed = time.time() - start_time
-                pm.log(
-                    f"\n[green]✓ Detection completed in {humanize.naturaldelta(elapsed)}[/green]"
-                )
+                pm.log(f"\n[green]✓ Detection completed in {humanize.naturaldelta(elapsed)}[/green]")
             else:
                 sys.exit(1)
-
     except KeyboardInterrupt:
         console.print("\n[yellow]Detection interrupted[/yellow]")
         sys.exit(0)
 
-    # Set database path and initialize groups
     app_state.db_path = config.db_path
-
-    # Load initial groups before starting server
     if app_state.db_path.exists():
-        load_active_groups(check_files=True)  # Check files on initial load
-        console.print(
-            f"[dim]Loaded {len(app_state.initial_active_groups)} active groups from database[/dim]"
-        )
+        load_active_groups(check_files=True)
+        console.print(f"[dim]Loaded {len(app_state.initial_active_groups)} active groups from database[/dim]")
 
-    # Launch web UI
-    console.print("\n[bold cyan]Launching review interface...[/bold cyan]")
-    console.print(f"Starting server on http://localhost:{args.port}")
-    console.print("Press Ctrl+C to stop\n")
-
-    # Auto-open browser after a short delay
-    if not args.no_browser:
-
-        def open_browser():
-            time.sleep(1.5)  # Give server time to start
-            webbrowser.open(f"http://localhost:{args.port}")
-
-        browser_thread = threading.Thread(target=open_browser, daemon=True)
-        browser_thread.start()
-
-    # Use waitress instead of Flask dev server
-    try:
-        serve(app, host="0.0.0.0", port=args.port, threads=4)
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Server stopped[/yellow]")
-        sys.exit(0)
+    _start_web_server(args.port, auto_open=not args.no_browser)
 
 
 if __name__ == "__main__":
