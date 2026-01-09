@@ -20,14 +20,20 @@ dependencies = [
     "waitress",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "ruff",
-    "pyright",
-]
+[dependency-groups]
+dev = ["ruff", "pyright"]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
 
 [tool.ruff]
-line-length = 100
+line-length = 88
 target-version = "py311"
 
 [tool.ruff.lint]
@@ -40,12 +46,15 @@ select = [
     "C4",     # flake8-comprehensions
     "UP",     # pyupgrade
     "SIM",    # flake8-simplify
+    "PTH",    # flake8-use-pathlib
+    "RUF",    # ruff-specific rules
+    "PIE",    # flake8-pie
+    "PERF",   # perflint
+    "PGH",    # pygrep-hooks
+    "PLE",    # pylint errors
 ]
 ignore = [
     "E501",   # line too long (handled by formatter)
-    "E402",   # module level import not at top (intentional - mp.set_start_method must run first)
+    "E402",   # module level import not at top (mp.set_start_method must run first)
+    "PERF203", # try-except in loop (sometimes unavoidable)
 ]
-
-[tool.pyright]
-pythonVersion = "3.11"
-typeCheckingMode = "basic"

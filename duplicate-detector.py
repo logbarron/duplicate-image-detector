@@ -284,7 +284,7 @@ atexit.register(cleanup_resources)
 class Config:
     """Configuration for enhanced duplicate detection"""
 
-    image_folder: Path = Path(".")
+    image_folder: Path = Path()
     base_dir: Path = Path(".duplicate-detector")
 
     mode: str = "integrated"
@@ -393,7 +393,7 @@ class MetadataExtractor:
             print(f"Error getting dimensions for {image_path}: {e}")
 
         try:
-            with open(image_path, "rb") as f:
+            with image_path.open("rb") as f:
                 tags = exifread.process_file(f, details=False, strict=False)
 
                 if "EXIF DateTimeOriginal" in tags:
@@ -407,11 +407,10 @@ class MetadataExtractor:
                 if "Image Model" in tags:
                     metadata["camera_model"] = str(tags["Image Model"]).strip()
 
-        # exifread's HEIC parser may raise a plain AssertionError – catch it as well
+        # exifread's HEIC parser may raise a plain AssertionError - catch it as well
         except (OSError, KeyError, AttributeError, AssertionError, exifread.core.heic.BadSize) as e:  # type: ignore[attr-defined]
             if isinstance(e, exifread.core.heic.BadSize):  # type: ignore[attr-defined]
                 print(f"Warning: Corrupted HEIC file detected: {image_path}")
-            pass
 
         if not metadata["datetime_original"] or not metadata["camera_make"]:
             try:
@@ -736,7 +735,7 @@ class FastModelManager:
 
     def cleanup(self):
         """Clean up models and free memory"""
-        for _name, model in self.models.items():
+        for model in self.models.values():
             del model
         self.models.clear()
         gc.collect()
@@ -985,7 +984,7 @@ class DuplicateFinder:
         duplicate_groups = []
         all_duplicates = set()
 
-        for _key, indices in metadata_groups.items():
+        for indices in metadata_groups.values():
             if len(indices) > 1:
                 duplicate_groups.append(indices)
                 all_duplicates.update(indices)
@@ -996,7 +995,7 @@ class DuplicateFinder:
         )
 
         if duplicate_groups and len(metadata_groups) > 0:
-            sample_key = list(metadata_groups.keys())[0]
+            sample_key = next(iter(metadata_groups.keys()))
             self.pm.log(f"[dim]Sample metadata key: {sample_key}[/dim]")
 
         return duplicate_groups, all_duplicates
@@ -1027,7 +1026,7 @@ class DuplicateFinder:
                 global_i = i + bi
                 for j in range(global_i + 1, n):
                     if similarities[bi, j] >= self.config.sscd_threshold:
-                        candidates.append(
+                        candidates.append(  # noqa: PERF401 - nested loop, comprehension hurts readability
                             {
                                 "idx1": global_i,
                                 "idx2": j,
@@ -1519,10 +1518,11 @@ def save_results_to_db(
             member_scores = {}
 
             for member in group_members:
-                scores = []
-                for result in finder.detailed_results:
-                    if result["orig_idx1"] == member or result["orig_idx2"] == member:
-                        scores.append(result.get("integrated_score", result["sscd_similarity"]))
+                scores = [
+                    result.get("integrated_score", result["sscd_similarity"])
+                    for result in finder.detailed_results
+                    if result["orig_idx1"] == member or result["orig_idx2"] == member
+                ]
                 if scores:
                     member_scores[member] = np.mean(scores)
 
@@ -1874,6 +1874,7 @@ def delete_images():
 
         deleted_count = 0
         deletion_results = []
+        group_complete = False
 
         # Collect all updates first
         ids_to_delete = []
@@ -1912,13 +1913,13 @@ def delete_images():
                 successfully_deleted.append(row)
 
                 # Also log to text file for compatibility
-                with open("deleted_files_log.txt", "a") as f:
+                with Path("deleted_files_log.txt").open("a") as f:
                     f.write(
                         f"{datetime.now()}: Deleted {image_path} (Group: {app_state.current_group_id})\n"
                     )
 
             except Exception as e:
-                deletion_results.append(f"✗ Failed: {row['name']} - {str(e)}")
+                deletion_results.append(f"✗ Failed: {row['name']} - {e!s}")
         else:
             deletion_results.append(f"✗ Not found: {row['name']}")
 
@@ -1941,7 +1942,7 @@ def delete_images():
 
         # Thread-safe state modifications
         with app_state._lock:
-            # Invalidate caches for this group and the total‑groups count
+            # Invalidate caches for this group and the total-groups count
             app_state.group_data_cache.remove(app_state.current_group_id)
             app_state.total_groups_cache = None
 
@@ -1992,7 +1993,7 @@ def next_group():
 
         # If not found, wrap around to beginning
         if not found_next:
-            for i in range(0, current_pos):
+            for i in range(current_pos):
                 group_id = app_state.initial_active_groups[i]
                 if group_id in app_state.active_groups_set:
                     app_state.current_group_id = group_id
@@ -2055,7 +2056,7 @@ def serve_image(image_id):
             return response
 
     except Exception as e:
-        return f"Error serving image: {str(e)}", 500
+        return f"Error serving image: {e!s}", 500
 
 
 # ==============================================================================
@@ -2136,6 +2137,7 @@ def run_detection(config: Config, pm: ProgressManager):
     exclude_indices = set()
     model_manager = None
     features = None
+    detection_mode = ""
 
     # Metadata detection
     if config.mode in ["metadata", "both"]:
